@@ -2387,7 +2387,6 @@ local Vaccinator = {} do
 			if GlobalReloadHeld then
 				UserCmd:SetButtons(UserCmd:GetButtons() & ~IN_RELOAD)
 			else
-				Notify("Performing cycle")
 				UserCmd:SetButtons(UserCmd:GetButtons() | IN_RELOAD)
 				GlobalCurrentResist = (CurrentResistType + 1) % 3
 				Weapon:SetResistType(GlobalCurrentResist)
