@@ -1,3 +1,14 @@
+--[[
+	Some notes:
+		- As of right now, this is not very optimized, lots of unnecessary table allocations and redundant
+		checks are done - those will be fixed later, you could also just inline every call now
+		- Pretty much a 1:1 paste - isn't lua idiomatic because of it, lot of repetition
+		and stuff that could be done better, once again, will be fixed later
+		- Most of the functions lack descriptions - got bored, there's like hundreds of functions
+		- Some things are still missing - rijin predicts when bonk timer ends, which we can't do
+		unless i listen for new conditions every tick which is just slow
+--]]
+
 local config = {
 	debug = false,
 	enabled = true,
@@ -35,11 +46,53 @@ local MAX_PLAYER_DIST = 32
 local MAX_PROJECTILE_DIST = 8
 local CLOSE_RANGE = 4
 local PROJECTILE_DANGER = 6
-local VULNERABLE_COST_MODIFIER = 0.9 -- Lowers cost by this modifier if player is vulnerable
-local HEALTH_COST_MULTIPLIER = 1.0 -- Multiples the cost reduction of players health
 local MAGIC_THREAT_VALUE = 6924
+local MAX_TABLE_POOL = 1024
 
+-- Forward declarations for CWeapon and CPlayer
 local CWeapon, CPlayer
+
+local GlobalResistUberState, GlobalWantedResistCycle, GlobalReloadHeld, GlobalCurrentResist = -1, -1, false, -1
+local GlobalResistCheckPredictionTime, GlobalPreferResist, GlobalForceAttack2 = 0, -1, false
+
+local CacheEvents = {
+	game_newmap = true,
+	client_disconnect = true,
+	player_death = true,
+	player_spawn = true
+}
+
+local HitscanWeapons = {
+	[TF_WEAPON_SHOTGUN_PRIMARY] = true,
+	[TF_WEAPON_SHOTGUN_SOLDIER] = true,
+	[TF_WEAPON_SHOTGUN_HWG] = true,
+	[TF_WEAPON_SHOTGUN_PYRO] = true,
+	[TF_WEAPON_SCATTERGUN] = true,
+	[TF_WEAPON_SNIPERRIFLE] = true,
+	[TF_WEAPON_MINIGUN] = true,
+	[TF_WEAPON_SMG] = true,
+	[TF_WEAPON_PISTOL] = true,
+	[TF_WEAPON_PISTOL_SCOUT] = true,
+	[TF_WEAPON_REVOLVER] = true,
+	[TF_WEAPON_SNIPERRIFLE_CLASSIC] = true,
+	[TF_WEAPON_CHARGED_SMG] = true,
+	[TF_WEAPON_PEP_BRAWLER_BLASTER] = true,
+	[TF_WEAPON_HANDGUN_SCOUT_PRIMARY] = true,
+}
+
+local HandledEntities = {
+	CObjectSentrygun = true,
+	CTFProjectile_Rocket = true,
+	CTFProjectile_SentryRocket = true,
+	CTFGrenadePipebombProjectile = true,
+	CTFProjectile_Arrow = true,
+	CTFProjectile_Flare = true,
+	CTFProjectile_SpellFireball = true,
+	CTFProjectile_BallOfFire = true,
+	CTFProjectile_HealingBolt = true,
+	CTFProjectile_EnergyBall = true,
+	CTFProjectile_SpellMeteorShower = true
+}
 
 ---@enum ResistanceTypes
 local RESIST_TYPES = {
@@ -65,9 +118,7 @@ local function Debug(Message, ...)
 	end
 
 	local Formatted = string.format(Message, ...)
-	-- Chud print isn't same as echo, isn't shown when developer=1
 	client.Command(string.format("echo %s", Formatted) .. "\n", true)
-	--print(string.format(Message, ...))
 end
 
 ---@param Message string
@@ -117,7 +168,7 @@ local function simple_spline(Value)
 end
 
 ---@param Value number
----@@param inmin number
+---@param inmin number
 ---@param inmax number
 ---@param outmin number
 ---@param outmax number
@@ -130,6 +181,21 @@ local function SimpleSplineRemap(Value, inmin, inmax, outmin, outmax)
 	local CValue = (Value - inmin) / (inmax - inmin)
 	CValue = clamp(CValue, 0, 1)
 	return outmin + (outmax - outmin) * simple_spline(CValue)
+end
+
+local Cooldowns = {Map = {}} do
+	---@param Name string
+	---@param Timeout number
+	---@return boolean cooldown_expired
+	function Cooldowns.Get(Name, Timeout)
+		local Happened = Cooldowns.Map[Name] or 0
+		if Happened > Timeout then
+			Cooldowns.Map[Name] = globals.CurTime()
+			return true
+		end
+		
+		return false
+	end
 end
 
 ---@class CEntity
@@ -315,20 +381,20 @@ local CEntity = {} do
 		function CEntity:GetLauncher()
 			local Launcher = self.Entity:GetPropEntity("m_hLauncher")
 			return (Launcher and Launcher:IsValid())
-				and CWeapon.from(Launcher)
+				and CWeapon.fromCached(Launcher)
 				or nil
 		end
 	end
 
 	do -- Buildings
-		---@return CPlayer? owner
+		---@return CEntity? owner
 		function CEntity:BuildingOwner()
 			local Builder = self.Entity:GetPropEntity("m_hBuilder")
 			if not Builder or not Builder:IsValid() then
 				return nil
 			end
 
-			return CPlayer.fromCached(Builder)
+			return CEntity.from(Builder)
 		end
 	
 		---@return boolean is_sapped
@@ -424,16 +490,26 @@ end
 CWeapon = {} do
 	CWeapon.__index = CWeapon
 
+	local TablePool = {}
 	---@type table<Entity, CWeapon>
 	local Cache = setmetatable({}, {__mode = "kv"})
 
 	---@param Weapon CEntity | Entity 
 	---@return CWeapon cweapon
-	function CWeapon.from(Weapon)
+	function CWeapon.from(Weapon, ReusedTable)
 		local WeaponEntity = ToRaw(Weapon)
 
 		DebugAssert(WeaponEntity and WeaponEntity:IsValid(), "CWeapon: Expected valid entity, got %s", type(WeaponEntity))
 		DebugAssert(WeaponEntity and WeaponEntity:IsWeapon(), "Expected a weapon entity")
+
+		if not ReusedTable and #TablePool > 0 then
+			ReusedTable = table.remove(TablePool, #TablePool)
+		end
+
+		if ReusedTable then
+			ReusedTable.Entity = WeaponEntity
+			return ReusedTable
+		end
 
 		return setmetatable({
 			Entity = WeaponEntity,
@@ -448,10 +524,11 @@ CWeapon = {} do
 			return nil
 		end
 
-		local Cached = Cache[WeaponEntity]
+		local Cached = Cache[WeaponEntity:GetIndex()]
 		if Cached then
 			if Cached:IsValid() then
 				-- only return if the cached cweapon is valid..
+				Cached.Entity = WeaponEntity
 				return Cached
 			end
 
@@ -459,13 +536,20 @@ CWeapon = {} do
 			--Cached:Release()
 		end
 		
-		local CWeaponObject = CWeapon.from(WeaponEntity)
-		Cache[WeaponEntity] = CWeaponObject
+		local CWeaponObject = CWeapon.from(WeaponEntity, Cached)
+		Cache[WeaponEntity:GetIndex()] = CWeaponObject
 
 		return CWeaponObject
 	end
 
 	function CWeapon.clearCache()
+		if #TablePool <= MAX_TABLE_POOL then
+			for _, Object in pairs(Cache) do
+				Object.Entity = nil
+				table.insert(TablePool, Object)
+			end
+		end
+
 		Cache = setmetatable({}, {__mode = "kv"})
 	end
 
@@ -705,13 +789,10 @@ CWeapon = {} do
 		end
 
 		if IsBlastDamage(ID, Definition) then
-			--Debug("Weapon of ID %d (Definition %d) is considered a blast weapon!", ID, Definition)
 			return RESIST_TYPES.BLAST_RESIST
 		elseif IsFireDamage(ID, Definition) then
-			--Debug("Weapon of ID %d (Definition %d) is considered a fire weapon!", ID, Definition)
 			return RESIST_TYPES.FIRE_RESIST
 		else
-			--Debug("Weapon of ID %d (Definition %d) is considered a weapon!", ID, Definition)
 			return RESIST_TYPES.AMMO_RESIST
 		end
 	end
@@ -722,16 +803,26 @@ end
 CPlayer = {} do
 	CPlayer.__index = CPlayer
 
+	local TablePool = {}
 	---@type table<Entity, CPlayer>
 	local Cache = setmetatable({}, {__mode = "kv"})
 
 	---@param Player AnyEntity
 	---@return CPlayer cplayer
-	function CPlayer.from(Player)
+	function CPlayer.from(Player, ReusedTable)
 		local PlayerEntity = ToRaw(Player)
 
  		DebugAssert(PlayerEntity and PlayerEntity:IsValid(), "CPlayer: Expected valid entity, got %s", type(PlayerEntity))
 		DebugAssert(PlayerEntity and PlayerEntity:IsPlayer(), "Expected a player entity")
+
+		if not ReusedTable and #TablePool > 0 then
+			ReusedTable = table.remove(TablePool, #TablePool)
+		end
+
+		if ReusedTable then
+			ReusedTable.Entity = PlayerEntity
+			return ReusedTable
+		end
 
 		return setmetatable({
 			Entity = PlayerEntity,
@@ -758,10 +849,11 @@ CPlayer = {} do
 			return nil
 		end
 
-		local Cached = Cache[PlayerEntity]
+		local Cached = Cache[PlayerEntity:GetIndex()]
 		if Cached then
 			if Cached:IsValid() then
 				-- only return if the cached cplayer is valid..
+				Cached.Entity = PlayerEntity
 				return Cached
 			end
 
@@ -769,21 +861,21 @@ CPlayer = {} do
 			--Cached:Release()
 		end
 
-		local CPlayerObject = CPlayer.from(PlayerEntity)
-		Cache[PlayerEntity] = CPlayerObject
+		local CPlayerObject = CPlayer.from(PlayerEntity, Cached)
+		Cache[PlayerEntity:GetIndex()] = CPlayerObject
 
 		return CPlayerObject
 	end
 
 	function CPlayer.clearCache()
-		Cache = setmetatable({}, {__mode = "kv"})
-	end
-
-	---@param self CPlayer
-	local function DebugValidCheck(self)
-		if config.debug then
-			assert(self:IsValid(), "DEBUG ASSERT: Entity is invalid")
+		if #TablePool <= MAX_TABLE_POOL then
+			for _, Object in pairs(Cache) do
+				Object.Entity = nil
+				table.insert(TablePool, Object)
+			end
 		end
+
+		Cache = setmetatable({}, {__mode = "kv"})
 	end
 
 	---@return nil
@@ -829,8 +921,6 @@ CPlayer = {} do
 	--- Returns the player's max health
 	---@return number max_health
 	function CPlayer:MaxHealth()
-		DebugValidCheck(self)
-
 		return self:IsValid()
 			and self.Entity:GetMaxHealth()
 			or 0
@@ -849,7 +939,6 @@ CPlayer = {} do
 	--- Returns whether the player is friends with the user
 	---@return boolean friend
 	function CPlayer:IsFriend()
-		DebugValidCheck(self)
 		if not self:IsValid() then
 			return false
 		end
@@ -895,14 +984,6 @@ CPlayer = {} do
 	---@return boolean crit_boosted
 	function CPlayer:IsCritBoosted()
 		return self.Entity:IsCritBoosted()
-		--[[return self:InCond(TFCond_CritMmmph)
-			or self:InCond(TFCond_Kritzkrieged)
-			or self:InCond(TFCond_CritOnWin)
-			or self:InCond(TFCond_CritOnFlagCapture)
-			or self:InCond(TFCond_CritOnKill)
-			or self:InCond(TFCond_HalloweenCritCandy)
-			or self:InCond(TFCond_CritCanteen)
-			or self:InCond(TFCond_CritOnFirstBlood)]]
 	end
 
 	---@return boolean on_fire
@@ -920,7 +1001,6 @@ CPlayer = {} do
 	function CPlayer:IsCloaked()
 		return self:InCond(TFCond_Cloaked)
 	end
-
 
 	---@return number
 	function CPlayer:Healers()
@@ -946,17 +1026,15 @@ CPlayer = {} do
 	---@param Class number
 	---@return boolean matches_class
 	function CPlayer:IsClass(Class)
-		DebugValidCheck(self)
 		local PlayerClass = self.Entity:GetPropInt("m_PlayerClass", "m_iClass")
-		return self:IsValid() and PlayerClass == Class
+		return PlayerClass == Class
 	end
 
 	--- Returns whether the condition is active
 	---@param Condition number
 	---@return boolean in_condition
 	function CPlayer:InCond(Condition)
-		DebugValidCheck(self)
-		return self:IsValid() and self.Entity:InCond(Condition)
+		return self.Entity:InCond(Condition)
 	end
 
 	--- Returns the currently selected weapon.
@@ -964,7 +1042,6 @@ CPlayer = {} do
 	---@param Slot number?
 	---@return CWeapon? weapon
 	function CPlayer:GetWeapon(Slot)
-		DebugValidCheck(self)
 		if not self:IsValid() then
 			return nil
 		end
@@ -975,7 +1052,7 @@ CPlayer = {} do
 				return nil
 			end
 
-			return CWeapon.from(Weapon)
+			return CWeapon.fromCached(Weapon)
 		end
 
 		local Weapon = self.Entity:GetPropEntity("m_hActiveWeapon")
@@ -983,7 +1060,7 @@ CPlayer = {} do
 			return nil
 		end
 
-		return CWeapon.from(Weapon)
+		return CWeapon.fromCached(Weapon)
 	end
 
 	function CPlayer:EntityFlags()
@@ -1028,6 +1105,9 @@ CPlayer = {} do
 	end
 end
 
+local MASK_BULLET = 0x46004023
+local MASK_EXPLOSION = 0x6004003
+local MASK_SHOT_HULL = 0x600400B
 local TR_CUSTOM_FILTER_NO_TEAM_BASED_ENTS = 1
 local TR_CUSTOM_FILTER_HIT_TEAM = 2
 ---@class CTrace
@@ -1181,6 +1261,16 @@ local AUTO_CHARGE_FIRE_INSTANT_KILL = 64
 ---@field BlastProjectileNearby number blast projectiles near protected
 ---@field StickiesNearby number stickies near protected
 
+---@type AutoVaccinatorState
+local State = {
+	Flags = 0,
+	Bullet = 1, Blast = 1, Fire = 1,
+	BulletDamage = 0, BlastDamage = 0, FireDamage = 0,
+	OverallBullet = 0, OverallBlast = 0, OverallFire = 0,
+	BlastProjectileNearby = 0, StickiesNearby = 0,
+	Burning = false
+}
+
 ---@param State AutoVaccinatorState
 local function PrintState(State)
 	print(string.format("Danger levels: bullet(%d), blast(%d), fire(%d)", State.Bullet, State.Blast, State.Fire))
@@ -1188,6 +1278,14 @@ local function PrintState(State)
 	print(string.format("Players: bullet(%d), blast(%d), fire(%d)", State.OverallBullet, State.OverallBlast, State.OverallFire))
 	print(string.format("Blast projectiles(%d), Stickies(%d)", State.BlastProjectileNearby, State.StickiesNearby))
 	print(string.format("Burning(%s)", State.Burning))
+end
+
+---@param State AutoVaccinatorState
+local function ResetState(State)
+	State.Flags, State.Bullet, State.Blast, State.Fire = 0, 0, 0, 0
+	State.BulletDamage, State.BlastDamage, State.FireDamage = 0, 0, 0
+	State.OverallBullet, State.OverallBlast, State.OverallFire = 0, 0, 0
+	State.Burning, State.BlastProjectileNearby, State.StickiesNearby = false, 0, 0
 end
 
 ---@param A Vector3
@@ -1233,14 +1331,6 @@ local function FovDelta(ViewAngle, Start, End)
 	return math.abs(math.max(NormalizedAngle(Degrees), 0))
 end
 
-local MASK_BULLET = 0x46004023
-local MASK_EXPLOSION = 0x6004003
-local MASK_SHOT_HULL = 0x600400B
-
-local LagStates = { Classes = {} }
-
-local GlobalResistUberState, GlobalWantedResistCycle, GlobalReloadHeld, GlobalCurrentResist = -1, -1, false, -1
-local GlobalResistCheckPredictionTime, GlobalPreferResist, GlobalForceAttack2 = 0, -1, false
 local Vaccinator = {} do
 	local function Latency()
 		local NetChannel = clientstate.GetNetChannel()
@@ -1533,13 +1623,12 @@ local Vaccinator = {} do
 	end
 
 
-	local NotificationCooldown = 0
 	---@param State AutoVaccinatorState
 	---@param Reason string
 	---@param Type ResistanceTypes
 	---@param Instant boolean?
 	function Vaccinator.ForceUberCharge(State, Reason, Type, Instant)
-		if globals.RealTime() - NotificationCooldown >= 1.5 then
+		if Cooldowns.Get("Notification", 1.5) then
 			NotificationCooldown = globals.RealTime()
 			Notify(string.format("Forced uber charge because of: %s", Reason))
 		end
@@ -1575,29 +1664,20 @@ local Vaccinator = {} do
 			return
 		end
 
-		if config.debug then
-			local Class = Entity.Entity:GetClass()
-			if LagStates.Classes[Class] then
-				LagStates.Classes[Class] = LagStates.Classes[Class] + 1
-			else
-				LagStates.Classes[Class] = 1
-			end
+		if Protect:IsUbercharged() or Protect:IsBonked() then
+			return
 		end
 
 		if Entity:Team() == Protect:Team() then
 			return
 		end
 
-		-- is_fake_projectile -> no launcher / harmless launcher (rocket jumper / base jumper)
-		if Entity:IsProjectile() then
+		local IsProjectile = Entity:IsProjectile()
+		if IsProjectile then
 			local Launcher = Entity:GetLauncher()
 			if Launcher and Launcher:IsHarmless() then
 				return
 			end
-		end
-
-		if Protect:IsUbercharged() or Protect:IsBonked() then
-			return
 		end
 
 		if gamerules.IsTruceActive() and not Entity:IsRocket() then
@@ -1608,7 +1688,8 @@ local Vaccinator = {} do
 		local BlastInRadius = false
 		local Distance = Vector3_DistanceMeters(Protect:Origin(), Entity:Origin())
 
-		if Entity:IsRocket() or Entity:IsDemoProjectile() or Entity:IsArrow() or Entity:IsFlameBall() or Entity:IsFlare() then
+		--if Entity:IsRocket() or Entity:IsDemoProjectile() or Entity:IsArrow() or Entity:IsFlameBall() or Entity:IsFlare() then
+		if Entity:IsProjectile() then
 			local Ping = clamp(Latency(), 0.1, 4)
 			local PredictedPosition = CTrace.Line(
 				Entity:Origin(),
@@ -1641,8 +1722,7 @@ local Vaccinator = {} do
 			State.Bullet = State.Bullet + 1
 
 			local Builder = Entity:BuildingOwner()
-			-- TODO: Builder can be non players, gotta change that in BuildingOwner
-			if Builder and Builder:InCond(TFCond_Buffed) then
+			if Builder and Builder:IsPlayer() and Builder:Raw():InCond(TFCond_Buffed) then
 				State.Bullet = State.Bullet + 6
 			end
 
@@ -1876,12 +1956,7 @@ local Vaccinator = {} do
 			return
 		end
 
-		--local LocalPlayer = CPlayer.fromCached(entities.GetLocalPlayer())
-		--if not LocalPlayer then
-		--	return
-		--end
-
-		if gamerules.IsTruceActive() --[[or gamerules.IsManagedMatchEnded()]] then
+		if gamerules.IsTruceActive() then
 			return
 		end
 
@@ -2084,7 +2159,6 @@ local Vaccinator = {} do
 			State.Fire = State.Fire + Player:Healers()
 
 			if Player:IsUbercharged() or Player:InCond(TFCond_MegaHeal) then
-				-- TODO instant kill flag?
 				Vaccinator.ForceUberCharge(State, "Player nearby that is uber/quickfix charged", RESIST_TYPES.FIRE_RESIST, true)
 			end
 
@@ -2094,7 +2168,6 @@ local Vaccinator = {} do
 
 			if Player:IsCritBoosted() then
 				if Distance <= 12 then
-					-- TODO instant kill flag?
 					Vaccinator.ForceUberCharge(State, "Crit boosted pyro nearby", RESIST_TYPES.FIRE_RESIST, true)
 				else
 					State.Fire = State.Fire + 2
@@ -2390,7 +2463,7 @@ local Vaccinator = {} do
 				UserCmd:SetButtons(UserCmd:GetButtons() | IN_RELOAD)
 				GlobalCurrentResist = (CurrentResistType + 1) % 3
 				Weapon:SetResistType(GlobalCurrentResist)
-				GlobalResistCheckPredictionTime = os.clock() + Vaccinator.Latency() + 0.15
+				GlobalResistCheckPredictionTime = os.clock() + Latency() + 0.15
 			end
 
 			UserCmd:SetButtons(UserCmd:GetButtons() & ~IN_ATTACK2)
@@ -2471,32 +2544,7 @@ local Vaccinator = {} do
 	end
 end
 
-local IgnoreClasses = {
-	CRopeKeyframe = true,
-	CSprite = true,
-	CLightGlow = true,
-	CSceneEntity = true,
-	CTFRagdoll = true,
-	CDynamicProp = true,
-	CTFWearable = true,
-	CFuncOccluder = true,
-	CBeam = true,
-	CFuncRespawnRoomVisualizer = true,
-	CTFDroppedWeapon = true,
-}
-local CombatClasses = {
-	CObjectSentrygun = true,
-	CTFProjectile_Rocket = true,
-	CTFProjectile_SentryRocket = true,
-	CTFGrenadePipebombProjectile = true,
-	CTFProjectile_Arrow = true,
-	CTFProjectile_Flare = true,
-	CTFProjectile_SpellFireball = true,
-	CTFProjectile_BallOfFire = true,
-	CTFProjectile_HealingBolt = true,
-	CTFProjectile_EnergyBall = true,
-	CTFProjectile_SpellMeteorShower = true
-}
+
 --- Runs auto vaccinator logic
 ---@param UserCmd UserCmd
 local function RunAutoVaccinator(UserCmd)
@@ -2506,8 +2554,6 @@ local function RunAutoVaccinator(UserCmd)
 
 	local SignonState = clientstate.GetClientSignonState()
 	if SignonState ~= E_SignonState.SIGNONSTATE_FULL then
-		Debug("SignonState ~= E_SignonState.SIGNONSTATE_FULL")
-		-- SIGNONSTATE_FULL: we are fully connected; first non-delta packet received
 		return
 	end
 
@@ -2527,15 +2573,7 @@ local function RunAutoVaccinator(UserCmd)
 		return
 	end
 
-	---@type AutoVaccinatorState
-	local State = {
-		Flags = 0,
-		Bullet = 1, Blast = 1, Fire = 1,
-		BulletDamage = 0, BlastDamage = 0, FireDamage = 0,
-		OverallBullet = 0, OverallBlast = 0, OverallFire = 0,
-		BlastProjectileNearby = 0, StickiesNearby = 0,
-		Burning = false
-	}
+	ResetState(State)
 
 	local VaccinatorCharges = Weapon:Charges()
 	if VaccinatorCharges == 0 then
@@ -2549,7 +2587,6 @@ local function RunAutoVaccinator(UserCmd)
 	end
 
 	local HealingTarget = CPlayer.fromCached(Weapon:HealingTarget())
-	LagStates.Classes = {}
 
 	Vaccinator.Handle(LocalPlayer, State)
 	Vaccinator.Handle(HealingTarget, State)
@@ -2578,7 +2615,7 @@ local function RunAutoVaccinator(UserCmd)
 		end
 
 		local Class = Entity:GetClass()
-		if not CombatClasses[Class] then
+		if not HandledEntities[Class] then
 			goto continue
 		end
 		
@@ -2591,24 +2628,6 @@ local function RunAutoVaccinator(UserCmd)
 		Vaccinator.HandleEntity(HealingTarget, CEnt, State)
 
 		::continue::
-	end
-
-	if config.debug then
-		PrintState(State)
-
-		local Classes = {}
-		for Class, _ in pairs(LagStates.Classes) do
-			table.insert(Classes, Class)
-		end
-
-		table.sort(Classes, function(a, b)
-			return LagStates.Classes[a] < LagStates.Classes[b]
-		end)
-
-		print(string.format("%d Classes scanned", #Classes))
-		for _, Class in ipairs(Classes) do
-			print(string.format("Class '%s' was checked %d times", Class, LagStates.Classes[Class]))
-		end
 	end
 	
 	local ShouldntProcessData = Vaccinator.ProcessManualCharge(LocalPlayer, UserCmd)
@@ -2626,12 +2645,6 @@ local function HandleCycle(UserCmd)
 	Vaccinator.PerformCycle(UserCmd)
 end
 
-local CacheEvents = {
-	game_newmap = true,
-	client_disconnect = true,
-	player_death = true,
-	player_spawn = true
-}
 --- Handles cache clearing on joining servers
 ---@param Event GameEvent
 local function Cache(Event)
@@ -2651,29 +2664,9 @@ local function Cache(Event)
 		GlobalResistUberState = -1
 		GlobalForceAttack2 = false
 		GlobalPreferResist = -1
-	
-		Debug("Cleared cache in event '%s'", Name)
 	end
 end
 
-local HitscanWeapons = {
-	[TF_WEAPON_SHOTGUN_PRIMARY] = true,
-	[TF_WEAPON_SHOTGUN_SOLDIER] = true,
-	[TF_WEAPON_SHOTGUN_HWG] = true,
-	[TF_WEAPON_SHOTGUN_PYRO] = true,
-	[TF_WEAPON_SCATTERGUN] = true,
-	[TF_WEAPON_SNIPERRIFLE] = true,
-	[TF_WEAPON_MINIGUN] = true,
-	[TF_WEAPON_SMG] = true,
-	[TF_WEAPON_PISTOL] = true,
-	[TF_WEAPON_PISTOL_SCOUT] = true,
-	[TF_WEAPON_REVOLVER] = true,
-	[TF_WEAPON_SNIPERRIFLE_CLASSIC] = true,
-	[TF_WEAPON_CHARGED_SMG] = true,
-	[TF_WEAPON_PEP_BRAWLER_BLASTER] = true,
-	[TF_WEAPON_HANDGUN_SCOUT_PRIMARY] = true,
-	-- [TF_WEAPON_HANDGUN_SCOUT_SECONDARY] = true,
-}
 ---@param Event GameEvent
 local function OnDamage(Event)
 	if not config.enabled then
@@ -2721,11 +2714,10 @@ local function OnDamage(Event)
 	local WeaponId = Event:GetInt("weaponid")
 
 	if (Crit or MiniCrit) and HitscanWeapons[WeaponId] then
-		-- In RijiN this is a debug message, but I think it would be more useful as a notification
-		Notify("Forcing vaccinator charge use because we're hit by a critical shot!")
-		-- TODO: Implement "prefer resist" / force attack 2 on next tick
-		-- I guess it isn't important to change resistances, since it's already probably
-		-- on the most likely resistance so if we get critted, we can just pop instantly
+		if Cooldowns.Get("Notification", 1.5) then
+			Notify("Forcing vaccinator charge use because we're hit by a critical shot!")
+		end
+
 		GlobalPreferResist = RESIST_TYPES.AMMO_RESIST
 		GlobalForceAttack2 = true
 	end
@@ -2774,10 +2766,9 @@ local function Prediction(Stage)
 		return
 	end
 
-	-- Grace period expired and server still differs: genuine prediction error
-	--if config.debug then
-	Notify("Resist type prediction error, predicted %d, got %d", GlobalCurrentResist, NewNetworkedResist)
-	--end
+	if config.debug then
+		Notify("Resist type prediction error, predicted %d, got %d", GlobalCurrentResist, NewNetworkedResist)
+	end
 
 	GlobalCurrentResist = NewNetworkedResist
 	Weapon:SetResistType(NewNetworkedResist)
@@ -2801,35 +2792,35 @@ end)
 
 callbacks.Register("FrameStageNotify", Prediction)
 
----@param From Vector3
----@param To Vector3
-local function Line3D(From, To)
-	local FromScreenSpace = client.WorldToScreen(From)
-	local ToScreenSpace = client.WorldToScreen(To)
-
-	if not FromScreenSpace or not ToScreenSpace then
-		return
-	end
-
-	draw.Line(
-		FromScreenSpace[1], FromScreenSpace[2],
-		ToScreenSpace[1], ToScreenSpace[2]
-	)
-end
-
-local function Text3D(Text, Position)
-	local ScreenSpace = client.WorldToScreen(Position)
-	if not ScreenSpace then
-		return
-	end
-
-	draw.Text(ScreenSpace[1], ScreenSpace[2], Text)
-end
-
 if config.debug then
+	---@param From Vector3
+	---@param To Vector3
+	local function Line3D(From, To)
+		local FromScreenSpace = client.WorldToScreen(From)
+		local ToScreenSpace = client.WorldToScreen(To)
+
+		if not FromScreenSpace or not ToScreenSpace then
+			return
+		end
+
+		draw.Line(
+			FromScreenSpace[1], FromScreenSpace[2],
+			ToScreenSpace[1], ToScreenSpace[2]
+		)
+	end
+
+	local function Text3D(Text, Position)
+		local ScreenSpace = client.WorldToScreen(Position)
+		if not ScreenSpace then
+			return
+		end
+
+		draw.Text(ScreenSpace[1], ScreenSpace[2], Text)
+	end
+
 	local f = draw.CreateFont("Tahoma", 15, 500, FONTFLAG_CUSTOM | FONTFLAG_ANTIALIAS)
 	draw.SetFont(f)
-	
+
 	callbacks.Register("Draw", function()
 		local LocalPlayer = CPlayer.fromCached(entities.GetLocalPlayer())
 		if not LocalPlayer then
@@ -2890,18 +2881,21 @@ if config.debug then
 					)
 
 					
+					---@diagnostic disable-next-line
+					local _trace = Trace.Trace
+
 					draw.Color(255, 255, 255, 255)
 					Text3D(string.format(
 						"fraction: %f, hit? %s",
-						Trace.Trace.fraction,
-						Trace.Trace.entity ~= nil and Trace.Trace.entity:GetClass() or "no"
+						_trace.fraction,
+						_trace.entity ~= nil and _trace.entity:GetClass() or "no"
 					), PredictedPosition)
 					
 					draw.Color(0, 0, 255, 255)
 					Line3D(PredictedShootPosition, PredictedPosition)
 
 					draw.Color(255, 255, 255, 255)
-					Line3D(PredictedShootPosition, Trace.Trace.endpos)
+					Line3D(PredictedShootPosition, _trace.endpos)
 				end
 			end
 
