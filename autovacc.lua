@@ -2826,43 +2826,30 @@ local function Text3D(Text, Position)
 	draw.Text(ScreenSpace[1], ScreenSpace[2], Text)
 end
 
-local f = draw.CreateFont("Tahoma", 15, 500, FONTFLAG_CUSTOM | FONTFLAG_ANTIALIAS)
-draw.SetFont(f)
-
-callbacks.Register("Draw", function()
-	local LocalPlayer = CPlayer.fromCached(entities.GetLocalPlayer())
-	if not LocalPlayer then
-		return
-	end
-
-	if not LocalPlayer:IsClass(TF2_Medic) then
-		return
-	end
-
-	local Weapon = LocalPlayer:GetWeapon()
-	if not Weapon or not Weapon:IsVaccinator() then
-		return
-	end
-
-	local HealingTarget = CPlayer.fromCached(Weapon:HealingTarget())
-	if HealingTarget then
-		draw.Color(255, 255, 255, 255)
-		Text3D(string.format(
-			"bullet(%s), blast(%s), fire(%s)",
-			HealingTarget:HasResistAgainst(RESIST_TYPES.AMMO_RESIST, true),
-			HealingTarget:HasResistAgainst(RESIST_TYPES.BLAST_RESIST, true),
-			HealingTarget:HasResistAgainst(RESIST_TYPES.FIRE_RESIST, true)
-		), HealingTarget:ShootPosition() + Vector3(0, 10, 0))
-	end
-end)
-
 if config.debug then
+	local f = draw.CreateFont("Tahoma", 15, 500, FONTFLAG_CUSTOM | FONTFLAG_ANTIALIAS)
+	draw.SetFont(f)
+	
 	callbacks.Register("Draw", function()
 		local LocalPlayer = CPlayer.fromCached(entities.GetLocalPlayer())
 		if not LocalPlayer then
 			return
 		end
-		
+
+		local Weapon = LocalPlayer:GetWeapon()
+		if Weapon and Weapon:IsVaccinator() then
+			local HealingTarget = CPlayer.fromCached(Weapon:HealingTarget())
+			if HealingTarget then
+				draw.Color(255, 255, 255, 255)
+				Text3D(string.format(
+					"bullet(%s), blast(%s), fire(%s)",
+					HealingTarget:HasResistAgainst(RESIST_TYPES.AMMO_RESIST, true),
+					HealingTarget:HasResistAgainst(RESIST_TYPES.BLAST_RESIST, true),
+					HealingTarget:HasResistAgainst(RESIST_TYPES.FIRE_RESIST, true)
+				), HealingTarget:ShootPosition() + Vector3(0, 10, 0))
+			end
+		end
+			
 		for Index = 1, entities.GetHighestEntityIndex() do
 			local Entity = entities.GetByIndex(Index)
 			if not Entity or not Entity:IsValid() then
