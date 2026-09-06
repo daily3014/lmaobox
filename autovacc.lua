@@ -19,6 +19,15 @@ local config = {
 	passive_resistance = "Bullet", -- "Bullet" / "Blast" / "Fire"
 	manual_charge = true, -- Allow manual charging?
 
+	-- react to 'Activate Charge'?
+	pop_on_activate_charge = {
+		enabled = true,
+		friends_only = false, -- only react to friends
+
+		-- what resist to pop, "Auto" will pick the one with most points 
+		resist = "Bullet", -- "Bullet", "Blast", "Fire"
+	},
+
 	filters = {
 		bonked = true, -- react to bonked players
 		friends = true, -- react to friends
@@ -98,12 +107,12 @@ local HandledEntities = {
 ---@enum ResistanceTypes
 local RESIST_TYPES = {
 	UNKNOWN = -1,
-	AMMO_RESIST = 0,
+	BULLET_RESIST = 0,
 	BLAST_RESIST = 1,
 	FIRE_RESIST = 2,
 }
 
-local ManualCharge = RESIST_TYPES.AMMO_RESIST
+local ManualCharge = RESIST_TYPES.BULLET_RESIST
 
 ---@param Message string
 ---@param ... any
@@ -891,7 +900,7 @@ CWeapon = {} do
 		elseif IsFireDamage(ID, Definition) then
 			return RESIST_TYPES.FIRE_RESIST
 		else
-			return RESIST_TYPES.AMMO_RESIST
+			return RESIST_TYPES.BULLET_RESIST
 		end
 	end
 end
@@ -1533,7 +1542,7 @@ local Vaccinator = {} do
 
 		if Player:IsClass(TF2_Heavy) and Player:InCond(TFCond_Slowed) then
 			if Player:IsUbercharged() or Player:IsCritBoosted()
-				or Player:HasResistAgainst(RESIST_TYPES.AMMO_RESIST)
+				or Player:HasResistAgainst(RESIST_TYPES.BULLET_RESIST)
 				or Player:HasResistAgainst(RESIST_TYPES.BLAST_RESIST)
 				or Player:HasResistAgainst(RESIST_TYPES.FIRE_RESIST)
 			then
@@ -1770,12 +1779,17 @@ local Vaccinator = {} do
 			return
 		end
 
-		if Cooldowns.Get(string.format("Notification%d", Type), 1.5) then
-			NotificationCooldown = globals.RealTime()
-			Notify(string.format("Forced uber charge because of: %s", Reason))
+		if not config.passive or (config.passive and Instant) then
+			-- DEVIATION: Don't display notification
+			-- if auto vaccinator is in passive mode
+			-- unless it's an instant kill
+			if Cooldowns.Get(string.format("Notification%d", Type), 1.5) then
+				NotificationCooldown = globals.RealTime()
+				Notify(Reason)
+			end
 		end
 
-		if Type == RESIST_TYPES.AMMO_RESIST then
+		if Type == RESIST_TYPES.BULLET_RESIST then
 			State.Flags = State.Flags | AUTO_CHARGE_BULLET
 			if Instant then
 				State.Flags = State.Flags | AUTO_CHARGE_BULLET_INSTANT_KILL
@@ -1842,7 +1856,7 @@ local Vaccinator = {} do
 		end
 
 		if Entity:IsSentry() and not Protect:IsDisguised() then
-			if Protect:HasResistAgainst(RESIST_TYPES.AMMO_RESIST, true) then
+			if Protect:HasResistAgainst(RESIST_TYPES.BULLET_RESIST, true) then
 				return
 			end
 
@@ -1869,7 +1883,7 @@ local Vaccinator = {} do
 			end
 
 			if not Entity:IsMiniSentry() then
-				Vaccinator.ForceUberCharge(State, "Sentry visible", RESIST_TYPES.AMMO_RESIST, true)
+				Vaccinator.ForceUberCharge(State, "Sentry visible", RESIST_TYPES.BULLET_RESIST, true)
 			else
 				State.Bullet = State.Bullet + 16
 				if Protect:IsVulnerable() then
@@ -1879,7 +1893,7 @@ local Vaccinator = {} do
 
 			return
 		elseif Entity:IsArrow() then
-			if Protect:HasResistAgainst(RESIST_TYPES.AMMO_RESIST, true) then
+			if Protect:HasResistAgainst(RESIST_TYPES.BULLET_RESIST, true) then
 				return
 			end
 
@@ -1904,7 +1918,7 @@ local Vaccinator = {} do
 			if BlastInRadius then
 				State.Bullet = State.Bullet + 16
 				if DistanceToHead <= 18 and Entity:IsHuntsmanArrow() or Entity:IsCritical() or Entity:IsDeflected() then
-					Vaccinator.ForceUberCharge(State, "Arrow lethal", RESIST_TYPES.AMMO_RESIST, true)
+					Vaccinator.ForceUberCharge(State, "Arrow lethal", RESIST_TYPES.BULLET_RESIST, true)
 				end
 			end
 
@@ -2146,8 +2160,8 @@ local Vaccinator = {} do
 		end
 
 		local PlayerEntity = Player:ToEntity()
-		if ResistType == RESIST_TYPES.AMMO_RESIST then
-			if Protect:HasResistAgainst(RESIST_TYPES.AMMO_RESIST, true) then
+		if ResistType == RESIST_TYPES.BULLET_RESIST then
+			if Protect:HasResistAgainst(RESIST_TYPES.BULLET_RESIST, true) then
 				PlayerEntity:Reclaim()
 				return
 			end
@@ -2170,12 +2184,12 @@ local Vaccinator = {} do
 			if ExpectedDamage > 0 then
 				ExpectedDamage = ExpectedDamage / 2
 				if (ExpectedDamage > (Protect:Health() * Protect:MaxHealth())) then
-					Vaccinator.ForceUberCharge(State, "Expected damage exceeds protected health", RESIST_TYPES.AMMO_RESIST)
+					Vaccinator.ForceUberCharge(State, "Expected damage exceeds protected health", RESIST_TYPES.BULLET_RESIST)
 				end
 			end
 
 			if Weapon:IsHuntsman() and InDangerRange then
-				Vaccinator.ForceUberCharge(State, "Huntsman player too close", RESIST_TYPES.AMMO_RESIST)
+				Vaccinator.ForceUberCharge(State, "Huntsman player too close", RESIST_TYPES.BULLET_RESIST)
 			end
 
 			if Player:IsUbercharged() or Player:InCond(TFCond_MegaHeal) then
@@ -2199,12 +2213,12 @@ local Vaccinator = {} do
 
 				if Distance <= LethalRange then
 					if Cheating then
-						Vaccinator.ForceUberCharge(State, "Cheater in lethal DT range", RESIST_TYPES.AMMO_RESIST)
+						Vaccinator.ForceUberCharge(State, "Cheater in lethal DT range", RESIST_TYPES.BULLET_RESIST)
 					else
 						Vaccinator.ForceUberCharge(
 							State,
 							Weapon:IsMinigun() and "Minigun in lethal range" or "Shotgun in lethal range",
-							RESIST_TYPES.AMMO_RESIST
+							RESIST_TYPES.BULLET_RESIST
 						)
 					end
 				end
@@ -2217,17 +2231,17 @@ local Vaccinator = {} do
 					State.Bullet = State.Bullet + 2
 				end
 
-				if Player:HasResistAgainst(RESIST_TYPES.AMMO_RESIST) then
+				if Player:HasResistAgainst(RESIST_TYPES.BULLET_RESIST) then
 					State.Bullet = State.Bullet + 2
 				end
 
-				if Player:HasResistAgainst(RESIST_TYPES.AMMO_RESIST, true)
+				if Player:HasResistAgainst(RESIST_TYPES.BULLET_RESIST, true)
 					or Player:HasResistAgainst(RESIST_TYPES.BLAST_RESIST, true)
 					or Player:HasResistAgainst(RESIST_TYPES.FIRE_RESIST, true)
 					or Player:IsUbercharged()
 				then
-					Vaccinator.ForceUberCharge(State, "Heavy nearby that is uber/vaccinator charged", RESIST_TYPES.AMMO_RESIST)
-				elseif Player:HasResistAgainst(RESIST_TYPES.AMMO_RESIST) then
+					Vaccinator.ForceUberCharge(State, "Heavy nearby that is uber/vaccinator charged", RESIST_TYPES.BULLET_RESIST)
+				elseif Player:HasResistAgainst(RESIST_TYPES.BULLET_RESIST) then
 					-- TODO: RijiN does the resist check twice, so it adds 6 if the heavy has passive bullet resist
 					State.Bullet = State.Bullet + 4
 				end
@@ -2248,7 +2262,7 @@ local Vaccinator = {} do
 						Vaccinator.ForceUberCharge(
 							State,
 							Cheating and "A cheating sniper was visible" or "Sniper aiming near head",
-							RESIST_TYPES.AMMO_RESIST
+							RESIST_TYPES.BULLET_RESIST
 						)
 					end
 				end
@@ -2455,7 +2469,7 @@ local Vaccinator = {} do
 				end
 			else
 				if State.Flags & AUTO_CHARGE_BULLET_INSTANT_KILL ~= 0 and not BlockBullet then
-					Resist = RESIST_TYPES.AMMO_RESIST
+					Resist = RESIST_TYPES.BULLET_RESIST
 				elseif State.Flags & AUTO_CHARGE_BLAST_INSTANT_KILL ~= 0 and not BlockBlast then
 					Resist = RESIST_TYPES.BLAST_RESIST
 				elseif State.Flags & AUTO_CHARGE_FIRE_INSTANT_KILL ~= 0 and not BlockFire then
@@ -2512,7 +2526,7 @@ local Vaccinator = {} do
 
 		if not config.passive then
 			if State.Bullet > State.Blast and State.Bullet > State.Fire and not BlockBullet then
-				Resist = RESIST_TYPES.AMMO_RESIST
+				Resist = RESIST_TYPES.BULLET_RESIST
 			elseif State.Blast > State.Bullet and State.Blast > State.Fire and not BlockBlast then
 				Resist = RESIST_TYPES.BLAST_RESIST
 			elseif State.Fire > State.Bullet and State.Fire > State.Blast and not BlockFire then
@@ -2525,7 +2539,7 @@ local Vaccinator = {} do
 		local Ubercharge = false
 		if GlobalResistUberState == -1 and Resist ~= -1 then
 			if config.passive
-				or Resist == RESIST_TYPES.AMMO_RESIST and State.Bullet >= UberCost
+				or Resist == RESIST_TYPES.BULLET_RESIST and State.Bullet >= UberCost
 				or Resist == RESIST_TYPES.BLAST_RESIST and State.Blast >= UberCost
 				or Resist == RESIST_TYPES.FIRE_RESIST and State.Fire >= UberCost
 			then
@@ -2584,6 +2598,7 @@ local Vaccinator = {} do
 		if Vaccinator.IsWantedCycle(GlobalPreferResist) then
 			UserCmd:SetButtons(UserCmd:GetButtons() | IN_ATTACK2)
 			GlobalForceAttack2 = false
+			GlobalPreferResist = -1
 		end
 	end
 
@@ -2695,6 +2710,65 @@ local Vaccinator = {} do
 		local Resist = ManualCharge
 		Vaccinator.SetWantedResist(Resist)
 		return true
+	end
+
+	---@param Client number
+	function Vaccinator.PopOnActivateCharge(Client)
+		if Client == client.GetLocalPlayerIndex() then
+			return
+		end
+
+		local LocalPlayer = CPlayer.fromCached(entities.GetLocalPlayer())
+		if not LocalPlayer then
+			return
+		end
+
+		if not LocalPlayer:IsAlive() then
+			return
+		end
+
+		if not LocalPlayer:IsClass(TF2_Medic) then
+			return
+		end
+
+		local Weapon = LocalPlayer:GetWeapon()
+		if not Weapon or not Weapon:IsVaccinator() then
+			return
+		end
+
+		if Weapon:Charges() <= 0 then
+			return
+		end
+
+		local HealingTarget = Weapon:HealingTarget()
+		if not HealingTarget then
+			return
+		end
+
+		if config.pop_on_activate_charge.friends_only then
+			if not HealingTarget:IsPlayer() then
+				return
+			end
+			
+			local HealingPlayer = CPlayer.fromCached(HealingTarget)
+			if not HealingPlayer or not HealingPlayer:IsFriend() then
+				return
+			end
+		end
+
+		if HealingTarget:GetIndex() == Client then
+			local WantedResist = config.pop_on_activate_charge.resist
+
+			if WantedResist == "Bullet" then
+				GlobalPreferResist = RESIST_TYPES.BULLET_RESIST
+			elseif WantedResist == "Blast" then
+				GlobalPreferResist = RESIST_TYPES.BLAST_RESIST
+			elseif WantedResist == "Fire" then
+				GlobalPreferResist = RESIST_TYPES.FIRE_RESIST
+			end
+
+			GlobalForceAttack2 = true
+		end
 	end
 end
 
@@ -2872,7 +2946,7 @@ local function OnDamage(Event)
 			Notify("Forcing vaccinator charge use because we're hit by a critical shot!")
 		end
 
-		GlobalPreferResist = RESIST_TYPES.AMMO_RESIST
+		GlobalPreferResist = RESIST_TYPES.BULLET_RESIST
 		GlobalForceAttack2 = true
 	end
 end
@@ -2929,6 +3003,28 @@ local function Prediction(Stage)
 	GlobalResistCheckPredictionTime = 0
 end
 
+---@param UserMessage UserMessage
+local function VoiceListen(UserMessage)
+	if not config.pop_on_activate_charge.enabled then
+		return
+	end
+
+	local ID = UserMessage:GetID()
+	if ID ~= E_UserMessage.VoiceSubtitle then
+		return
+	end
+
+	local BitBuf = UserMessage:GetBitBuffer()
+
+	local Client = BitBuf:ReadInt(8)
+	local Menu = BitBuf:ReadInt(8)
+	local Item = BitBuf:ReadInt(8)
+
+	if Menu == 1 and Item == 6 then
+		Vaccinator.PopOnActivateCharge(Client)
+	end
+end
+
 ---@diagnostic disable-next-line
 callbacks.Register("CreateMove", function(UserCmd)
 	RunAutoVaccinator(UserCmd)
@@ -2944,6 +3040,7 @@ callbacks.Register("FireGameEvent", function(Event)
 	end
 end)
 
+callbacks.Register("DispatchUserMessage", VoiceListen)
 callbacks.Register("FrameStageNotify", Prediction)
 
 if config.debug then
@@ -2988,7 +3085,7 @@ if config.debug then
 				draw.Color(255, 255, 255, 255)
 				Text3D(string.format(
 					"bullet(%s), blast(%s), fire(%s)",
-					HealingTarget:HasResistAgainst(RESIST_TYPES.AMMO_RESIST, true),
+					HealingTarget:HasResistAgainst(RESIST_TYPES.BULLET_RESIST, true),
 					HealingTarget:HasResistAgainst(RESIST_TYPES.BLAST_RESIST, true),
 					HealingTarget:HasResistAgainst(RESIST_TYPES.FIRE_RESIST, true)
 				), HealingTarget:ShootPosition() + Vector3(0, 10, 0))
