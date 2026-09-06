@@ -20,8 +20,8 @@ local config = {
 	manual_charge = true, -- Allow manual charging?
 
 	filters = {
-		bonked = false, -- react to bonked players
-		friends = false, -- react to friends
+		bonked = true, -- react to bonked players
+		friends = true, -- react to friends
 	},
 
 	-- which resistance types to skip
@@ -41,6 +41,7 @@ local config = {
 	},
 }
 
+
 local UBER_COST = 26 -- If danger exceeds cost, vaccinator will pop
 local MAX_PLAYER_DIST = 32
 local MAX_PROJECTILE_DIST = 8
@@ -58,8 +59,8 @@ local GlobalResistCheckPredictionTime, GlobalPreferResist, GlobalForceAttack2 = 
 local CacheEvents = {
 	game_newmap = true,
 	client_disconnect = true,
-	player_death = true,
-	player_spawn = true
+	--player_death = true,
+	--player_spawn = true
 }
 
 local HitscanWeapons = {
@@ -189,8 +190,8 @@ local Cooldowns = {Map = {}} do
 	---@return boolean cooldown_expired
 	function Cooldowns.Get(Name, Timeout)
 		local Happened = Cooldowns.Map[Name] or 0
-		if Happened > Timeout then
-			Cooldowns.Map[Name] = globals.CurTime()
+		if (globals.RealTime() - Happened) > Timeout then
+			Cooldowns.Map[Name] = globals.RealTime()
 			return true
 		end
 		
@@ -200,15 +201,54 @@ end
 
 ---@class CEntity
 ---@field private Entity Entity?
+---@field private Class string
+---@field private Cache {}
 local CEntity = {} do
 	CEntity.__index = CEntity
+
+	local TablePool = {}
 
 	---@param Entity Entity
 	---@return CEntity entity
 	function CEntity.from(Entity)
 		DebugAssert(type(Entity) ~= "table", "Expected lmaobox entity, got %s", type(Entity))
 		DebugAssert(Entity and Entity:IsValid(), "CEntity: Expected valid entity, got %s", type(Entity))
+
+		if #TablePool > 0 then
+			local ReusedTable = table.remove(TablePool, #TablePool)
+			ReusedTable.Class = Entity:GetClass()
+			ReusedTable.Entity = Entity
+			ReusedTable.Cache = {}
+			return ReusedTable
+		end
+
+		return setmetatable({
+			Entity = Entity,
+			Class = Entity:GetClass(),
+			Cache = {}
+		}, CEntity)
+	end
+
+
+	---@param Entity Entity
+	---@return AnyCEntity? entity
+	function CEntity.toAny(Entity)
+		if Entity:IsPlayer() then
+			return CPlayer.fromCached(Entity)
+		elseif Entity:IsWeapon() then
+			return CWeapon.fromCached(Entity)
+		end
+
 		return setmetatable({Entity = Entity}, CEntity)
+	end
+
+	--- Recycles the object for further use
+	function CEntity:Reclaim()
+		self.Entity = nil
+
+		if #TablePool < MAX_TABLE_POOL then
+			table.insert(TablePool, self)
+		end
 	end
 
 	---@param Other AnyEntity?
@@ -264,7 +304,7 @@ local CEntity = {} do
 	do -- Projectiles
 		---@return boolean is_critical_projectile
 		function CEntity:IsCritical()
-			local Class = self.Entity:GetClass()
+			local Class = self.Class
 			if Class == "CTFProjectile_EnergyBall" then
 				return self.Entity:GetPropBool("m_bChargedShot")
 			end
@@ -318,9 +358,21 @@ local CEntity = {} do
 			CTFProjectile_BallOfFire = true,
 		}
 
+		---@param Entity Entity
+		---@return boolean is_projectile
+		function CEntity.ExIsProjectile(Entity)
+			local Class = Entity:GetClass()
+			
+			if Class == "CTFProjectile_HealingBolt" or Class == "CTFProjectile_Arrow" then
+				return Entity:EstimateAbsVelocity():Length() > 1
+			end
+
+			return Projectiles[Class] == true
+		end
+
 		---@return boolean is_projectile
 		function CEntity:IsProjectile()
-			local Class = self.Entity:GetClass()
+			local Class = self.Class
 			
 			if Class == "CTFProjectile_HealingBolt" or Class == "CTFProjectile_Arrow" then
 				return self:IsArrow()
@@ -331,7 +383,7 @@ local CEntity = {} do
 	
 		---@return boolean is_rocket
 		function CEntity:IsRocket()
-			local Class = self.Entity:GetClass()
+			local Class = self.Class
 			return Class == "CTFProjectile_Rocket"
 				or Class == "CTFProjectile_SentryRocket"
 				or Class == "CTFProjectile_EnergyBall"
@@ -339,36 +391,36 @@ local CEntity = {} do
 
 		---@return boolean is_demo_projectile
 		function CEntity:IsDemoProjectile()
-			return self.Entity:GetClass() == "CTFGrenadePipebombProjectile"
+			return self.Class == "CTFGrenadePipebombProjectile"
 		end
 
 		---@return boolean is_arrow
 		function CEntity:IsArrow()
-			local Class = self.Entity:GetClass()
+			local Class = self.Class
 			return (Class == "CTFProjectile_Arrow" or Class == "CTFProjectile_HealingBolt")
 				and self:EstVelocity():Length() > 1
 		end
 
 		---@return boolean is_flare
 		function CEntity:IsFlare()
-			return self.Entity:GetClass() == "CTFProjectile_Flare"
+			return self.Class == "CTFProjectile_Flare"
 		end
 
 		---@return boolean is_fire_spell
 		function CEntity:IsFireSpell()
-			local Class = self.Entity:GetClass()
+			local Class = self.Class
 			return Class == "CTFProjectile_SpellFireball"
 				or Class == "CTFProjectile_SpellMeteorShower"
 		end
 
 		---@return boolean is_flame_ball
 		function CEntity:IsFlameBall()
-			return self.Entity:GetClass() == "CTFProjectile_BallOfFire"
+			return self.Class == "CTFProjectile_BallOfFire"
 		end
 		
 		---@return boolean is_huntsman_arrow
 		function CEntity:IsHuntsmanArrow()
-			return self.Entity:GetClass() == "CTFProjectile_Arrow"
+			return self.Class == "CTFProjectile_Arrow"
 				and self.Entity:GetPropInt("m_iProjectileType") == 8
 		end
 
@@ -387,14 +439,14 @@ local CEntity = {} do
 	end
 
 	do -- Buildings
-		---@return CEntity? owner
+		---@return AnyCEntity? owner
 		function CEntity:BuildingOwner()
 			local Builder = self.Entity:GetPropEntity("m_hBuilder")
 			if not Builder or not Builder:IsValid() then
 				return nil
 			end
 
-			return CEntity.from(Builder)
+			return CEntity.toAny(Builder)
 		end
 	
 		---@return boolean is_sapped
@@ -421,7 +473,7 @@ local CEntity = {} do
 	do -- Sentry
 		---@return boolean is_sentry
 		function CEntity:IsSentry()
-			return self.Entity:GetClass() == "CObjectSentrygun"
+			return self.Class == "CObjectSentrygun"
 		end
 
 		---@return boolean is_mini_sentry
@@ -429,7 +481,7 @@ local CEntity = {} do
 			return self:IsSentry() and self.Entity:GetPropBool("m_bMiniBuilding")
 		end
 	
-		---@return CEntity? target
+		---@return AnyCEntity? target
 		function CEntity:GetSentryTarget()
 			if not self:IsSentry() and not self:IsMiniSentry() then
 				return nil
@@ -437,7 +489,7 @@ local CEntity = {} do
 
 			local AutoAimHandle = self.Entity:GetPropEntity("m_hAutoAimTarget")
 			return AutoAimHandle
-				and CEntity.from(AutoAimHandle)
+				and CEntity.toAny(AutoAimHandle)
 				or nil
 		end
 	end
@@ -445,7 +497,21 @@ local CEntity = {} do
 	--- Returns the entity's origin
 	---@return Vector3 origin
 	function CEntity:Origin()
-		return self.Entity:GetAbsOrigin() --self.Entity:GetPropVector("m_vecOrigin")
+		local Tick = globals.TickCount()
+		local CachedOrigin = self.Cache.Origin
+		if CachedOrigin and CachedOrigin.Origin then
+			if CachedOrigin.Tick == Tick then
+				return CachedOrigin.Value
+			end
+
+			CachedOrigin.Tick = Tick
+			CachedOrigin.Value = self.Entity:GetAbsOrigin()
+			return CachedOrigin.Value
+		end
+
+		local Origin = self.Entity:GetAbsOrigin()
+		self.Cache.Origin = {Tick = Tick, Value = Origin}
+		return Origin
 	end
 
 	---@return Vector3 obb_center
@@ -487,12 +553,14 @@ end
 
 ---@class CWeapon
 ---@field private Entity Entity?
+---@field private Cache {}
 CWeapon = {} do
 	CWeapon.__index = CWeapon
 
 	local TablePool = {}
 	---@type table<Entity, CWeapon>
-	local Cache = setmetatable({}, {__mode = "kv"})
+	--local Cache = setmetatable({}, {__mode = "kv"})
+	local Cache = {}
 
 	---@param Weapon CEntity | Entity 
 	---@return CWeapon cweapon
@@ -508,11 +576,13 @@ CWeapon = {} do
 
 		if ReusedTable then
 			ReusedTable.Entity = WeaponEntity
+			ReusedTable.Cache = {}
 			return ReusedTable
 		end
 
 		return setmetatable({
 			Entity = WeaponEntity,
+			Cache = {}
 		}, CWeapon)
 	end
 
@@ -528,7 +598,7 @@ CWeapon = {} do
 		if Cached then
 			if Cached:IsValid() then
 				-- only return if the cached cweapon is valid..
-				Cached.Entity = WeaponEntity
+				-- Cached.Entity = WeaponEntity
 				return Cached
 			end
 
@@ -550,7 +620,8 @@ CWeapon = {} do
 			end
 		end
 
-		Cache = setmetatable({}, {__mode = "kv"})
+		--Cache = setmetatable({}, {__mode = "kv"})
+		Cache = {}
 	end
 
 	---@return nil
@@ -800,12 +871,14 @@ end
 
 ---@class CPlayer
 ---@field private Entity Entity?
+---@field private Cache {}
 CPlayer = {} do
 	CPlayer.__index = CPlayer
 
 	local TablePool = {}
 	---@type table<Entity, CPlayer>
-	local Cache = setmetatable({}, {__mode = "kv"})
+	--local Cache = setmetatable({}, {__mode = "kv"})
+	local Cache = {}
 
 	---@param Player AnyEntity
 	---@return CPlayer cplayer
@@ -821,11 +894,13 @@ CPlayer = {} do
 
 		if ReusedTable then
 			ReusedTable.Entity = PlayerEntity
+			ReusedTable.Cache = {}
 			return ReusedTable
 		end
 
 		return setmetatable({
 			Entity = PlayerEntity,
+			Cache = {}
 		}, CPlayer)
 	end
 
@@ -835,7 +910,7 @@ CPlayer = {} do
 		local Entity = entities.GetByUserID(UserId)
 
 		if Entity and Entity:IsValid() then
-			return CPlayer.from(Entity)
+			return CPlayer.fromCached(Entity)
 		end
 
 		return nil
@@ -853,7 +928,7 @@ CPlayer = {} do
 		if Cached then
 			if Cached:IsValid() then
 				-- only return if the cached cplayer is valid..
-				Cached.Entity = PlayerEntity
+				--Cached.Entity = PlayerEntity
 				return Cached
 			end
 
@@ -875,7 +950,8 @@ CPlayer = {} do
 			end
 		end
 
-		Cache = setmetatable({}, {__mode = "kv"})
+		--Cache = setmetatable({}, {__mode = "kv"})
+		Cache = {}
 	end
 
 	---@return nil
@@ -889,7 +965,7 @@ CPlayer = {} do
 			self.Entity = nil
 		end
 
-		if Cache[self.Entity] then
+		if self.Entity ~= nil and Cache[self.Entity] then
 			Cache[self.Entity] = nil
 		end
 	end
@@ -1137,61 +1213,64 @@ local CTrace = {} do
 		CLaserDot = true, --Couldn't find
 	}
 
+	local TracePool = {}
 
-	---@param TraceLocalPlayer AnyCEntity
-	Filters[TR_CUSTOM_FILTER_NO_TEAM_BASED_ENTS] = function(TraceLocalPlayer)
-		---@param Entity Entity
-		---@param ContentsMask integer
-		---@return boolean should_hit
-		return function(Entity, ContentsMask)
-			if not TraceLocalPlayer or not TraceLocalPlayer:IsValid() or Entity:GetIndex() == TraceLocalPlayer:GetIndex() then
-				return false
-			end
+	---@type number?
+	local FilterLocalIndex
 
-			local Ent = CEntity.from(Entity)
-			if Ent:IsProjectile() then
-				return false
-			end
-			
-			local EntClass = Entity:GetClass()
-			if FilterIgnore[EntClass] then
-				return false
-			end
-
-			if EntClass == "CTFPlayer"
-				or EntClass == "CObjectSentrygun"
-				or EntClass == "CObjectDispenser"
-				or EntClass == "CObjectTeleporter"
-			then
-				return false
-			end
-
-			return true
+	---@param Entity Entity
+	---@param ContentsMask integer
+	---@return boolean should_hit
+	Filters[TR_CUSTOM_FILTER_NO_TEAM_BASED_ENTS] = function(Entity, ContentsMask)
+		if not FilterLocalIndex then
+			return false
 		end
+
+		if Entity:GetIndex() == FilterLocalIndex then
+			return false
+		end
+
+		if CEntity.ExIsProjectile(Entity) then
+			return false
+		end
+		
+		local EntClass = Entity:GetClass()
+		if FilterIgnore[EntClass] then
+			return false
+		end
+
+		if EntClass == "CTFPlayer"
+			or EntClass == "CObjectSentrygun"
+			or EntClass == "CObjectDispenser"
+			or EntClass == "CObjectTeleporter"
+		then
+			return false
+		end
+
+		return true
 	end
 
-	---@param TraceLocalPlayer AnyCEntity
-	Filters[TR_CUSTOM_FILTER_HIT_TEAM] = function(TraceLocalPlayer)
-		---@param Entity Entity
-		---@param ContentsMask integer
-		---@return boolean should_hit
-		return function(Entity, ContentsMask)
-			if not TraceLocalPlayer or not TraceLocalPlayer:IsValid() or Entity:GetIndex() == TraceLocalPlayer:GetIndex() then
-				return false
-			end
-
-			local Ent = CEntity.from(Entity)
-			if Ent:IsProjectile() then
-				return false
-			end
-			
-			local EntClass = Entity:GetClass()
-			if FilterIgnore[EntClass] then
-				return false
-			end
-
-			return true
+	---@param Entity Entity
+	---@param ContentsMask integer
+	---@return boolean should_hit
+	Filters[TR_CUSTOM_FILTER_HIT_TEAM] = function(Entity, ContentsMask)
+		if not FilterLocalIndex then
+			return false
 		end
+
+		if Entity:GetIndex() == FilterLocalIndex then
+			return false
+		end
+		if CEntity.ExIsProjectile(Entity) then
+			return false
+		end
+		
+		local EntClass = Entity:GetClass()
+		if FilterIgnore[EntClass] then
+			return false
+		end
+
+		return true
 	end
 
 	---@param Source Vector3
@@ -1210,7 +1289,10 @@ local CTrace = {} do
 	---@param LocalPlayer AnyCEntity
 	---@return Vector3 end
 	function CTrace.FLine(Source, Destination, Mask, Filter, LocalPlayer)
-		local Trace = engine.TraceLine(Source, Destination, Mask or MASK_ALL, Filters[Filter](LocalPlayer))
+		FilterLocalIndex = LocalPlayer:GetIndex()
+		local Trace = engine.TraceLine(Source, Destination, Mask or MASK_ALL, Filters[Filter])
+		FilterLocalIndex = nil
+
 		return Trace.endpos
 	end
 
@@ -1221,7 +1303,19 @@ local CTrace = {} do
 	---@param LocalPlayer AnyCEntity
 	---@return CTrace trace
 	function CTrace.Ray(Source, Destination, Mask, Filter, LocalPlayer)
-		local Trace = engine.TraceLine(Source, Destination, Mask or MASK_ALL, Filters[Filter](LocalPlayer))
+		FilterLocalIndex = LocalPlayer:GetIndex()
+		local Trace = engine.TraceLine(Source, Destination, Mask or MASK_ALL, Filters[Filter])
+		FilterLocalIndex = nil
+
+		if #TracePool > 0 then
+			local ReusedTable = table.remove(TracePool, #TracePool)
+
+			ReusedTable.Trace = Trace
+			ReusedTable.Start = Trace.startpos
+			ReusedTable.End = Trace.endpos
+
+			return ReusedTable
+		end
 
 		return setmetatable({
 			Trace = Trace,
@@ -1232,10 +1326,24 @@ local CTrace = {} do
 	
 
 	---@param Entity AnyEntity?
+	---@param AutoReclaim boolean?
 	---@return boolean visible
-	function CTrace:Visible(Entity)
-		return self.Trace.fraction >= 1 or
-			(Entity ~= nil and self.Trace.entity ~= nil and Entity:Is(self.Trace.entity));
+	function CTrace:Visible(Entity, AutoReclaim)
+		local IsVisible = self.Trace.fraction >= 1 or
+			(Entity ~= nil and self.Trace.entity ~= nil and Entity:Is(self.Trace.entity))
+
+		if AutoReclaim then
+			self:Reclaim()
+		end
+
+		return IsVisible
+	end
+
+	function CTrace:Reclaim()
+		if #TracePool < MAX_TABLE_POOL then
+			self.Trace, self.Start, self.End = nil, nil, nil
+			table.insert(TracePool, self)
+		end
 	end
 end
 
@@ -1455,7 +1563,7 @@ local Vaccinator = {} do
 				Protect
 			)
 
-			if Trace:Visible(Entity) then
+			if Trace:Visible(Entity, true) then
 				return true, InBlastRadius
 			else
 				Trace = CTrace.Ray(
@@ -1465,7 +1573,8 @@ local Vaccinator = {} do
 					TR_CUSTOM_FILTER_NO_TEAM_BASED_ENTS,
 					Protect
 				)
-				return Trace:Visible(Entity), InBlastRadius
+
+				return Trace:Visible(Entity, true), InBlastRadius
 			end
 		else
 			if Entity:IsDormant() then
@@ -1487,7 +1596,7 @@ local Vaccinator = {} do
 					Protect
 				)
 
-				if Trace:Visible(Entity) then
+				if Trace:Visible(Entity, true) then
 					return true, InBlastRadius
 				end
 
@@ -1507,7 +1616,7 @@ local Vaccinator = {} do
 					BlastDistance = 2
 				end
 
-				local BlastTrace = CTrace.Ray(
+				local BlastTrace = CTrace.FLine(
 					Entity:Origin(),
 					Entity:Origin() + (Pos * 1024),
 					MASK_SHOT_HULL,
@@ -1516,15 +1625,15 @@ local Vaccinator = {} do
 				)
 
 				local BlastVisibleTrace = CTrace.Ray(
-					BlastTrace.End,
+					BlastTrace,
 					PredictedShootPosition,
 					MASK_EXPLOSION,
 					TR_CUSTOM_FILTER_HIT_TEAM,
 					Entity
 				)
 			
-				if BlastVisibleTrace:Visible(Protect) then
-					InBlastRadius = Vector3_DistanceMeters(PredictedShootPosition, BlastTrace.End) <= BlastDistance
+				if BlastVisibleTrace:Visible(Protect, true) then
+					InBlastRadius = Vector3_DistanceMeters(PredictedShootPosition, BlastTrace) <= BlastDistance
 					return true, InBlastRadius
 				end
 			elseif Entity:IsDemoProjectile() then
@@ -1538,6 +1647,7 @@ local Vaccinator = {} do
 
 				if Trace:Visible(Entity) then
 					InBlastRadius = Vector3_Distance(Trace.Start, Trace.End) <= 250
+					Trace:Reclaim()
 					return true, InBlastRadius
 				end
 			else
@@ -1555,6 +1665,7 @@ local Vaccinator = {} do
 						or CLOSE_RANGE
 
 					InBlastRadius = Vector3_DistanceMeters(PredictedShootPosition, Trace.End) <= DeathDistance
+					Trace:Reclaim()
 					return true, InBlastRadius
 				end
 			end
@@ -1628,7 +1739,7 @@ local Vaccinator = {} do
 	---@param Type ResistanceTypes
 	---@param Instant boolean?
 	function Vaccinator.ForceUberCharge(State, Reason, Type, Instant)
-		if Cooldowns.Get("Notification", 1.5) then
+		if Cooldowns.Get(string.format("Notification%d", Type), 1.5) then
 			NotificationCooldown = globals.RealTime()
 			Notify(string.format("Forced uber charge because of: %s", Reason))
 		end
@@ -1935,8 +2046,6 @@ local Vaccinator = {} do
 
 			return
 		end
-
-		print("Entity passed through, no checks")
 	end
 
 	--- Calculates danger of player in relation to Protect
@@ -2005,8 +2114,10 @@ local Vaccinator = {} do
 			return
 		end
 
+		local PlayerEntity = Player:ToEntity()
 		if ResistType == RESIST_TYPES.AMMO_RESIST then
 			if Protect:HasResistAgainst(RESIST_TYPES.AMMO_RESIST, true) then
+				PlayerEntity:Reclaim()
 				return
 			end
 
@@ -2014,7 +2125,8 @@ local Vaccinator = {} do
 				State.OverallBullet = State.OverallBullet + 1
 			end
 
-			if not Vaccinator.IsVisible(Player:ToEntity(), Protect, PredictPlayers) and Distance >= CLOSE_RANGE - 2 then
+			if not Vaccinator.IsVisible(PlayerEntity, Protect, PredictPlayers) and Distance >= CLOSE_RANGE - 2 then
+				PlayerEntity:Reclaim()
 				return
 			end
 
@@ -2050,7 +2162,7 @@ local Vaccinator = {} do
 			end
 
 			if Weapon:IsShotgun() or Weapon:IsScatterGun() or (Weapon:IsMinigun() and Player:InCond(TFCond_Slowed)) then
-				if Distance <= CLOSE_RANGE then
+				if Distance <= (CLOSE_RANGE * 2) then -- DEVIATION: Increased range
 					if Cheating then
 						Vaccinator.ForceUberCharge(State, "Cheater in lethal DT range", RESIST_TYPES.AMMO_RESIST)
 					else
@@ -2108,15 +2220,18 @@ local Vaccinator = {} do
 			end
 		elseif ResistType == RESIST_TYPES.BLAST_RESIST then
 			if Protect:HasResistAgainst(RESIST_TYPES.BLAST_RESIST, true) then
+				PlayerEntity:Reclaim()
 				return
 			end
 
 			if Weapon:IsHarmless() then
+				PlayerEntity:Reclaim()
 				return
 			end
 
 			State.OverallBlast = State.OverallBlast + 1
-			if not Vaccinator.IsVisible(Player:ToEntity(), Protect, false) then
+			if not Vaccinator.IsVisible(PlayerEntity, Protect, false) then
+				PlayerEntity:Reclaim()
 				return
 			end
 
@@ -2146,11 +2261,13 @@ local Vaccinator = {} do
 			end
 		elseif ResistType == RESIST_TYPES.FIRE_RESIST then
 			if Protect:HasResistAgainst(RESIST_TYPES.FIRE_RESIST, true) then
+				PlayerEntity:Reclaim()
 				return
 			end
 
 			State.OverallFire = State.OverallFire + 1
-			if not Vaccinator.IsVisible(Player:ToEntity(), Protect, false) then
+			if not Vaccinator.IsVisible(PlayerEntity, Protect, false) then
+				PlayerEntity:Reclaim()
 				return
 			end
 
@@ -2180,6 +2297,8 @@ local Vaccinator = {} do
 				State.Fire = State.Fire + 12
 			end
 		end
+
+		PlayerEntity:Reclaim()
 	end
 
 	---@param HealingTarget CPlayer?
@@ -2544,7 +2663,6 @@ local Vaccinator = {} do
 	end
 end
 
-
 --- Runs auto vaccinator logic
 ---@param UserCmd UserCmd
 local function RunAutoVaccinator(UserCmd)
@@ -2608,28 +2726,30 @@ local function RunAutoVaccinator(UserCmd)
 		::continue::
 	end
 
-	for Index = 1, entities.GetHighestEntityIndex() do
-		local Entity = entities.GetByIndex(Index)
-		if not Entity or not Entity:IsValid() then
-			goto continue
-		end
+	for Class, _ in pairs(HandledEntities) do
+		local Entities = entities.FindByClass(Class)
 
-		local Class = Entity:GetClass()
-		if not HandledEntities[Class] then
-			goto continue
-		end
-		
-		if Entity:IsDormant() then
-			goto continue
-		end
-		
-		local CEnt = CEntity.from(Entity)
-		Vaccinator.HandleEntity(LocalPlayer, CEnt, State)
-		Vaccinator.HandleEntity(HealingTarget, CEnt, State)
+		for _, Entity in pairs(Entities) do
+			if not Entity:IsValid() then
+				goto continue
+			end
 
-		::continue::
+			if Entity:IsDormant() then
+				goto continue
+			end
+			
+			local CEnt = CEntity.from(Entity)
+			Vaccinator.HandleEntity(LocalPlayer, CEnt, State)
+			if HealingTarget then
+				Vaccinator.HandleEntity(HealingTarget, CEnt, State)
+			end
+
+			CEnt:Reclaim()
+
+			::continue::
+		end
 	end
-	
+
 	local ShouldntProcessData = Vaccinator.ProcessManualCharge(LocalPlayer, UserCmd)
 	if not ShouldntProcessData then
 		ShouldntProcessData = Vaccinator.ProcessManualCharge(HealingTarget, UserCmd)
@@ -2714,7 +2834,7 @@ local function OnDamage(Event)
 	local WeaponId = Event:GetInt("weaponid")
 
 	if (Crit or MiniCrit) and HitscanWeapons[WeaponId] then
-		if Cooldowns.Get("Notification", 1.5) then
+		if Cooldowns.Get("Notification0", 1.5) then
 			Notify("Forcing vaccinator charge use because we're hit by a critical shot!")
 		end
 
@@ -2840,7 +2960,7 @@ if config.debug then
 				), HealingTarget:ShootPosition() + Vector3(0, 10, 0))
 			end
 		end
-			
+
 		for Index = 1, entities.GetHighestEntityIndex() do
 			local Entity = entities.GetByIndex(Index)
 			if not Entity or not Entity:IsValid() then
@@ -2898,6 +3018,7 @@ if config.debug then
 					Line3D(PredictedShootPosition, _trace.endpos)
 				end
 			end
+			CEnt:Reclaim()
 
 			::continue::
 		end
