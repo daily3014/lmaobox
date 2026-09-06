@@ -1462,17 +1462,17 @@ end
 ---@param End Vector3
 ---@return number fov_delta
 local function FovDelta(ViewAngle, Start, End)
+	local Delta = End - Start
+	local Distance = Delta:Length()
+	if Distance == 0 then
+		return 0
+	end
+
+	local Direction = Vector3(Delta.x / Distance, Delta.y / Distance, Delta.z / Distance)
 	local Forward = ViewAngle:Forward()
+	local Dot = clamp(Forward:Dot(Direction), -1, 1)
 
-	local Direction = Vector3(
-		End.x - Start.x,
-		End.y - Start.y,
-		End.z - Start.z
-	)
-
-	Direction:Normalize()
-	local Degrees = math.acos(math.min(Forward:Dot(Direction), 1)) * (180 / math.pi) 
-	return math.abs(math.max(NormalizedAngle(Degrees), 0))
+	return math.acos(Dot) * (180 / math.pi)
 end
 
 local Vaccinator = {} do
