@@ -202,7 +202,7 @@ end
 ---@class CEntity
 ---@field private Entity Entity?
 ---@field private Class string
----@field private Cache {}
+---@field Cache {}
 local CEntity = {} do
 	CEntity.__index = CEntity
 
@@ -229,6 +229,40 @@ local CEntity = {} do
 		}, CEntity)
 	end
 
+	---@param self CEntity
+	---@param Name string
+	---@return boolean cache_valid
+	---@return {} cache
+	local function TryCache(self, Name)
+		local Tick = globals.TickCount()
+		local Cached = self.Cache[Name]
+
+		if Cached and Cached.Value then
+			if Cached.Tick == Tick then
+				return true, Cached
+			end
+
+			Cached.Tick = Tick
+			return false, Cached
+		end
+
+		local NewCache = {Tick = Tick}
+		self.Cache[Name] = NewCache
+		return false, NewCache
+	end
+
+	---@generic T
+	---@param self CEntity
+	---@param Name string
+	---@return T?
+	local function GetCache(self, Name)
+		local Cached = self.Cache[Name]
+		if not Cached then
+			return nil
+		end
+
+		return Cached.Value
+	end
 
 	---@param Entity Entity
 	---@return AnyCEntity? entity
@@ -497,21 +531,14 @@ local CEntity = {} do
 	--- Returns the entity's origin
 	---@return Vector3 origin
 	function CEntity:Origin()
-		local Tick = globals.TickCount()
-		local CachedOrigin = self.Cache.Origin
-		if CachedOrigin and CachedOrigin.Origin then
-			if CachedOrigin.Tick == Tick then
-				return CachedOrigin.Value
-			end
-
-			CachedOrigin.Tick = Tick
-			CachedOrigin.Value = self.Entity:GetAbsOrigin()
-			return CachedOrigin.Value
+		local Valid, Cache = TryCache(self, "Origin")
+		if Valid then
+			---@type Vector3
+			return Cache.Value
 		end
 
-		local Origin = self.Entity:GetAbsOrigin()
-		self.Cache.Origin = {Tick = Tick, Value = Origin}
-		return Origin
+		Cache.Value = self.Entity:GetAbsOrigin()
+		return Cache.Value
 	end
 
 	---@return Vector3 obb_center
@@ -1739,6 +1766,10 @@ local Vaccinator = {} do
 	---@param Type ResistanceTypes
 	---@param Instant boolean?
 	function Vaccinator.ForceUberCharge(State, Reason, Type, Instant)
+		if State.Flags & AUTO_CHARGE_CANNOT_UBER ~= 0 then
+			return
+		end
+
 		if Cooldowns.Get(string.format("Notification%d", Type), 1.5) then
 			NotificationCooldown = globals.RealTime()
 			Notify(string.format("Forced uber charge because of: %s", Reason))
@@ -2162,7 +2193,11 @@ local Vaccinator = {} do
 			end
 
 			if Weapon:IsShotgun() or Weapon:IsScatterGun() or (Weapon:IsMinigun() and Player:InCond(TFCond_Slowed)) then
-				if Distance <= (CLOSE_RANGE * 2) then -- DEVIATION: Increased range
+				local LethalRange = Cheating
+					and CLOSE_RANGE * 2 -- DEVIATION: Increased range
+					or CLOSE_RANGE
+
+				if Distance <= LethalRange then
 					if Cheating then
 						Vaccinator.ForceUberCharge(State, "Cheater in lethal DT range", RESIST_TYPES.AMMO_RESIST)
 					else
@@ -2695,7 +2730,6 @@ local function RunAutoVaccinator(UserCmd)
 
 	local VaccinatorCharges = Weapon:Charges()
 	if VaccinatorCharges == 0 then
-		--return
 		State.Flags = State.Flags | AUTO_CHARGE_CANNOT_UBER
 	end
 
