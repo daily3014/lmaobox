@@ -678,6 +678,16 @@ CWeapon = {} do
 			or false
 	end
 
+	---@return boolean is_weapon
+	function CWeapon:IsWeapon()
+		return false
+	end
+
+	---@return boolean is_player
+	function CWeapon:IsPlayer()
+		return false
+	end
+
 	-- CEntity inherits
 	CWeapon.Origin = CEntity.Origin
 	CWeapon.GetIndex = CEntity.GetIndex
@@ -1022,6 +1032,15 @@ CPlayer = {} do
 		return self:IsValid() and self.Entity:IsAlive()
 	end
 
+	---@return boolean is_weapon
+	function CPlayer:IsWeapon()
+		return false
+	end
+
+	---@return boolean is_player
+	function CPlayer:IsPlayer()
+		return true
+	end
 
 	-- CEntity inherits
 	CPlayer.Is = CEntity.Is
@@ -1178,7 +1197,6 @@ CPlayer = {} do
 	function CPlayer:EntityFlags()
 		return self.Entity:GetPropInt("m_fFlags")
 	end
-
 	---@return Vector3 shoot_position
 	function CPlayer:ShootPosition()
 		--[[
@@ -1200,7 +1218,7 @@ CPlayer = {} do
 	---@return EulerAngles view_angle
 	function CPlayer:ViewAngles()
 		local EyeAngles = self.Entity:GetPropVector("tfnonlocaldata", "m_angEyeAngles[0]")
-		return EulerAngles(EyeAngles.x, EyeAngles.y, EyeAngles.z)
+		return EulerAngles(EyeAngles.x, EyeAngles.y, 0)
 	end
 
 	---@return Vector3 obb_center
@@ -1463,16 +1481,16 @@ end
 ---@return number fov_delta
 local function FovDelta(ViewAngle, Start, End)
 	local Delta = End - Start
-	local Distance = Delta:Length()
-	if Distance == 0 then
+	if Delta:Length() == 0 then
 		return 0
 	end
 
-	local Direction = Vector3(Delta.x / Distance, Delta.y / Distance, Delta.z / Distance)
-	local Forward = ViewAngle:Forward()
-	local Dot = clamp(Forward:Dot(Direction), -1, 1)
+	local AimAngle = Delta:Angles()
 
-	return math.acos(Dot) * (180 / math.pi)
+	local DeltaPitch = NormalizedAngle(ViewAngle.x - AimAngle.x)
+	local DeltaYaw = NormalizedAngle(ViewAngle.y - AimAngle.y)
+
+	return math.sqrt(DeltaPitch * DeltaPitch + DeltaYaw * DeltaYaw)
 end
 
 local Vaccinator = {} do
@@ -2258,7 +2276,7 @@ local Vaccinator = {} do
 						IsScoped = Player:InCond(TFCond_Slowed)
 					end
 					
-					if IsScoped and FOV < 8 or Cheating then
+					if (IsScoped and FOV < 8) or Cheating then
 						Vaccinator.ForceUberCharge(
 							State,
 							Cheating and "A cheating sniper was visible" or "Sniper aiming near head",
@@ -3069,7 +3087,7 @@ if config.debug then
 		draw.Text(ScreenSpace[1], ScreenSpace[2], Text)
 	end
 
-	local f = draw.CreateFont("Tahoma", 15, 500, FONTFLAG_CUSTOM | FONTFLAG_ANTIALIAS)
+	local f = draw.CreateFont("Tahoma", 8, 200, FONTFLAG_CUSTOM | FONTFLAG_ANTIALIAS)
 	draw.SetFont(f)
 
 	callbacks.Register("Draw", function()
@@ -3148,6 +3166,16 @@ if config.debug then
 					draw.Color(255, 255, 255, 255)
 					Line3D(PredictedShootPosition, _trace.endpos)
 				end
+			elseif CEnt:IsPlayer() then
+				local Plr = CPlayer.fromCached(CEnt)
+				if not Plr or not Plr:IsClass(TF2_Sniper) then
+					CEnt:Reclaim()
+					goto continue
+				end
+
+				local FOV = FovDelta(Plr:ViewAngles(), Plr:ShootPosition(), LocalPlayer:ShootPosition())
+				draw.Color(255, (FOV < 10) and 0 or 255, (FOV < 10) and 0 or 255, 255)
+				Text3D(string.format("fov delta = %f", FOV), Plr:ShootPosition())
 			end
 			CEnt:Reclaim()
 
