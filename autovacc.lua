@@ -1836,11 +1836,7 @@ local Vaccinator = {} do
 				)
 
 				if Trace:Visible(Entity) then
-					local DeathDistance = Entity:IsArrow()
-						and 2
-						or CLOSE_RANGE
-
-					InBlastRadius = Vector3_DistanceMeters(PredictedShootPosition, Trace.End) <= DeathDistance
+					InBlastRadius = Vector3_DistanceMeters(PredictedShootPosition, Trace.End) <= CLOSE_RANGE
 					Trace:Reclaim()
 					return true, InBlastRadius
 				else
