@@ -23,8 +23,8 @@ local config = {
 		enabled = true,
 		friends_only = false, -- only react to friends
 
-		-- what resist to pop, "Auto" will pick the one with most points (not added yet)
-		resist = "Bullet", -- "Bullet", "Blast", "Fire"
+		-- what resist to pop, "Auto" will pick the one with most points
+		resist = "Auto", -- "Bullet", "Blast", "Fire", "Auto"
 	},
 
 	filters = {
@@ -59,8 +59,9 @@ local MAGIC_THREAT_VALUE = 6924
 local MAX_TABLE_POOL = 1024
 local CACHE_LIFETIME = 30 -- how many ticks a cached entity lasts for
 
--- Forward declarations for CWeapon and CPlayer
+-- Forward declarations for CWeapon, CPlayer and RunAutoVaccinator
 local CWeapon, CPlayer
+local RunAutoVaccinator
 
 local GlobalResistUberState, GlobalWantedResistCycle, GlobalReloadHeld, GlobalCurrentResist = -1, -1, false, -1
 local GlobalResistCheckPredictionTime, GlobalPreferResist, GlobalForceAttack2 = 0, -1, false
@@ -118,6 +119,7 @@ local RESIST_TYPES = {
 }
 
 local ManualCharge = RESIST_TYPES.BULLET_RESIST
+
 
 ---@param Message string
 ---@param ... any
@@ -210,6 +212,55 @@ local Cooldowns = {Map = {}} do
 		end
 		
 		return false
+	end
+end
+
+---@class DummyUserCmd
+---@field command_number integer
+---@field tick_count integer
+---@field viewangles EulerAngles
+---@field forwardmove number
+---@field sidemove number
+---@field upmove number
+---@field buttons integer
+---@field impulse integer
+---@field weaponselect integer
+---@field weaponsubtype integer
+---@field random_seed integer
+---@field mousedx integer
+---@field mousedy integer
+---@field hasbeenpredicted boolean
+---@field sendpacket boolean
+local DummyUserCmd = {} do
+
+	---@return DummyUserCmd usercmd
+	function DummyUserCmd.new()
+		return setmetatable({
+			command_number = clientstate.GetLastOutgoingCommand() + 1,
+			tick_count = GlobalTickCount,
+			viewangles = EulerAngles(0, 0, 0),
+			forwardmove = 0, sidemove = 0, upmove = 0,
+			buttons = 0, impulse = 0,
+			weaponselect = 0, weaponsubtype = 0,
+			random_seed = 0,
+			mousedx = 0, mousedy = 0,
+			hasbeenpredicted = false, sendpacket = true,
+		}, DummyUserCmd)
+	end
+
+	---@return integer buttons
+	function DummyUserCmd:GetButtons()
+		return self.buttons
+	end
+
+	---@param Buttons integer
+	function DummyUserCmd:SetButtons(Buttons)
+		self.buttons = Buttons
+	end
+
+	---@return UserCmd casted_dummy_usercmd
+	function DummyUserCmd:Cast()
+		return self --[[@type any]]
 	end
 end
 
@@ -1474,6 +1525,7 @@ local AUTO_CHARGE_CANNOT_UBER = 8
 local AUTO_CHARGE_BULLET_INSTANT_KILL = 16
 local AUTO_CHARGE_BLAST_INSTANT_KILL = 32
 local AUTO_CHARGE_FIRE_INSTANT_KILL = 64
+local AUTO_CHARGE_FORCE_UBER = 128
 ---@class AutoVaccinatorState
 ---@field Flags number flags
 ---@field BulletDamage number bullet damage total
@@ -1785,7 +1837,7 @@ local Vaccinator = {} do
 
 				if Trace:Visible(Entity) then
 					local DeathDistance = Entity:IsArrow()
-						and CLOSE_RANGE * 2
+						and 2
 						or CLOSE_RANGE
 
 					InBlastRadius = Vector3_DistanceMeters(PredictedShootPosition, Trace.End) <= DeathDistance
@@ -2585,39 +2637,39 @@ local Vaccinator = {} do
 
 	---@param UserCmd UserCmd
 	---@param HealingTarget CPlayer?
-	---@param State AutoVaccinatorState
-	function Vaccinator.ProcessData(UserCmd, HealingTarget, State)
-		if not State then
+	---@param Data AutoVaccinatorState
+	function Vaccinator.ProcessData(UserCmd, HealingTarget, Data)
+		if not Data then
 			return
 		end
 
 		local Resist = -1
 		local UberCost = Vaccinator.CalculateUberCost(HealingTarget)
 
-		if State.BlastProjectileNearby >= PROJECTILE_DANGER then
-			State.Blast = State.Blast + 4
+		if Data.BlastProjectileNearby >= PROJECTILE_DANGER then
+			Data.Blast = Data.Blast + 4
 		end
 
 		local BlockBullet, BlockBlast, BlockFire = false, false, false
 		local BlockCount = 0
 
 		if config.disallow.bullet then
-			State.OverallBullet = -MAGIC_THREAT_VALUE
-			State.Bullet = -MAGIC_THREAT_VALUE
+			Data.OverallBullet = -MAGIC_THREAT_VALUE
+			Data.Bullet = -MAGIC_THREAT_VALUE
 			BlockBullet = true
 			BlockCount = BlockCount + 1
 		end
 
 		if config.disallow.blast then
-			State.OverallBlast = -MAGIC_THREAT_VALUE
-			State.Blast = -MAGIC_THREAT_VALUE
+			Data.OverallBlast = -MAGIC_THREAT_VALUE
+			Data.Blast = -MAGIC_THREAT_VALUE
 			BlockBlast = true
 			BlockCount = BlockCount + 1
 		end
 
 		if config.disallow.fire then
-			State.OverallFire = -MAGIC_THREAT_VALUE
-			State.Fire = -MAGIC_THREAT_VALUE
+			Data.OverallFire = -MAGIC_THREAT_VALUE
+			Data.Fire = -MAGIC_THREAT_VALUE
 			BlockFire = true
 			BlockCount = BlockCount + 1
 		end
@@ -2629,66 +2681,73 @@ local Vaccinator = {} do
 
 		local SingleChargeMode = BlockCount == 2
 
-		if State.Flags > 0 then
+		if Data.Flags > 0 then
 			if not config.passive then
-				if State.Flags & AUTO_CHARGE_BULLET ~= 0 and not BlockBullet then
-					State.Bullet = State.Bullet + MAGIC_THREAT_VALUE
-				elseif State.Flags & AUTO_CHARGE_BLAST ~= 0 and not BlockBlast then
-					State.Blast = State.Blast + MAGIC_THREAT_VALUE
-				elseif State.Flags & AUTO_CHARGE_FIRE ~= 0 and not BlockFire then
-					State.Fire = State.Fire + MAGIC_THREAT_VALUE
+				if Data.Flags & AUTO_CHARGE_BULLET ~= 0 and not BlockBullet then
+					Data.Bullet = Data.Bullet + MAGIC_THREAT_VALUE
+				elseif Data.Flags & AUTO_CHARGE_BLAST ~= 0 and not BlockBlast then
+					Data.Blast = Data.Blast + MAGIC_THREAT_VALUE
+				elseif Data.Flags & AUTO_CHARGE_FIRE ~= 0 and not BlockFire then
+					Data.Fire = Data.Fire + MAGIC_THREAT_VALUE
 				end
 			else
-				if State.Flags & AUTO_CHARGE_BULLET_INSTANT_KILL ~= 0 and not BlockBullet then
+				if Data.Flags & AUTO_CHARGE_BULLET_INSTANT_KILL ~= 0 and not BlockBullet then
 					Resist = RESIST_TYPES.BULLET_RESIST
-				elseif State.Flags & AUTO_CHARGE_BLAST_INSTANT_KILL ~= 0 and not BlockBlast then
+				elseif Data.Flags & AUTO_CHARGE_BLAST_INSTANT_KILL ~= 0 and not BlockBlast then
 					Resist = RESIST_TYPES.BLAST_RESIST
-				elseif State.Flags & AUTO_CHARGE_FIRE_INSTANT_KILL ~= 0 and not BlockFire then
+				elseif Data.Flags & AUTO_CHARGE_FIRE_INSTANT_KILL ~= 0 and not BlockFire then
 					Resist = RESIST_TYPES.FIRE_RESIST
 				end
 			end
 		end
 
-		if State.Bullet > 1 then
+		if Data.Bullet > 1 then
 			local Multiplier = clamp(config.sensitivity.bullet, 0.01, 2)
-			State.Bullet = math.max(clamp(round(State.Bullet * Multiplier), 1, MAGIC_THREAT_VALUE), 1)
+			Data.Bullet = math.max(clamp(round(Data.Bullet * Multiplier), 1, MAGIC_THREAT_VALUE), 1)
 		end
 
-		if State.Blast > 1 then
+		if Data.Blast > 1 then
 			local Multiplier = clamp(config.sensitivity.blast, 0.01, 2)
-			State.Blast = math.max(clamp(round(State.Blast * Multiplier), 1, MAGIC_THREAT_VALUE), 1)
+			Data.Blast = math.max(clamp(round(Data.Blast * Multiplier), 1, MAGIC_THREAT_VALUE), 1)
 		end
 
-		if State.Fire > 1 then
+		if Data.Fire > 1 then
 			local Multiplier = clamp(config.sensitivity.fire, 0.01, 2)
-			State.Fire = math.max(clamp(round(State.Fire * Multiplier), 1, MAGIC_THREAT_VALUE), 1)
+			Data.Fire = math.max(clamp(round(Data.Fire * Multiplier), 1, MAGIC_THREAT_VALUE), 1)
 		end
 
 		if not SingleChargeMode then
-			local Equal = BlockCount == 0 and (State.Bullet == State.Blast and State.Blast == State.Fire)
+			local Equal = BlockCount == 0 and (Data.Bullet == Data.Blast and Data.Blast == Data.Fire)
 			if not Equal then
-				Equal = (BlockBullet and State.Blast == State.Fire)
-					or (BlockBlast and State.Bullet == State.Fire)
-					or (BlockFire and State.Bullet == State.Blast)
+				Equal = (BlockBullet and Data.Blast == Data.Fire)
+					or (BlockBlast and Data.Bullet == Data.Fire)
+					or (BlockFire and Data.Bullet == Data.Blast)
 			end
 
 			if Equal then
-				if State.Burning and not BlockFire then
-					State.Fire = State.Fire + 1
+				if Data.Burning and not BlockFire then
+					Data.Fire = Data.Fire + 1
 				else
 					if config.passive_resistance == "Bullet" and not BlockBullet then
-						State.Bullet = State.Bullet + 1
+						Data.Bullet = Data.Bullet + 1
 					elseif config.passive_resistance == "Blast" and not BlockBlast then
-						State.Blast = State.Blast + 1
+						Data.Blast = Data.Blast + 1
 					elseif config.passive_resistance == "Fire" and not BlockFire then
-						State.Fire = State.Fire + 1
+						Data.Fire = Data.Fire + 1
 					else
-						if State.OverallBullet > State.OverallBlast and State.OverallBullet > State.OverallFire and not BlockBullet then
-							State.Bullet = State.Bullet + 1
-						elseif State.OverallBlast > State.OverallBullet and State.OverallBlast > State.OverallFire and not BlockBlast then
-							State.Blast = State.Blast + 1
-						elseif State.OverallFire > State.OverallBullet and State.OverallFire > State.OverallBlast and not BlockFire then
-							State.Fire = State.Fire + 1
+						if not BlockBullet and not BlockBlast and not BlockFire then
+							-- passive_resistance isn't any of the three resistances
+							if Cooldowns.Get("PassiveResistanceInvalid", 5) then
+								Notify("config.passive_resistance: '%s' is invalid! Expected 'Bullet', 'Blast' or 'Fire'", tostring(config.passive_resistance))
+							end
+						end
+
+						if Data.OverallBullet > Data.OverallBlast and Data.OverallBullet > Data.OverallFire and not BlockBullet then
+							Data.Bullet = Data.Bullet + 1
+						elseif Data.OverallBlast > Data.OverallBullet and Data.OverallBlast > Data.OverallFire and not BlockBlast then
+							Data.Blast = Data.Blast + 1
+						elseif Data.OverallFire > Data.OverallBullet and Data.OverallFire > Data.OverallBlast and not BlockFire then
+							Data.Fire = Data.Fire + 1
 						end
 					end
 				end
@@ -2696,23 +2755,24 @@ local Vaccinator = {} do
 		end
 
 		if not config.passive then
-			if State.Bullet > State.Blast and State.Bullet > State.Fire and not BlockBullet then
+			if Data.Bullet > Data.Blast and Data.Bullet > Data.Fire and not BlockBullet then
 				Resist = RESIST_TYPES.BULLET_RESIST
-			elseif State.Blast > State.Bullet and State.Blast > State.Fire and not BlockBlast then
+			elseif Data.Blast > Data.Bullet and Data.Blast > Data.Fire and not BlockBlast then
 				Resist = RESIST_TYPES.BLAST_RESIST
-			elseif State.Fire > State.Bullet and State.Fire > State.Blast and not BlockFire then
+			elseif Data.Fire > Data.Bullet and Data.Fire > Data.Blast and not BlockFire then
 				Resist = RESIST_TYPES.FIRE_RESIST
 			else
 				return
 			end
 		end
 
-		local Ubercharge = false
+		local Ubercharge = Data.Flags & AUTO_CHARGE_FORCE_UBER ~= 0
+
 		if GlobalResistUberState == -1 and Resist ~= -1 then
 			if config.passive
-				or Resist == RESIST_TYPES.BULLET_RESIST and State.Bullet >= UberCost
-				or Resist == RESIST_TYPES.BLAST_RESIST and State.Blast >= UberCost
-				or Resist == RESIST_TYPES.FIRE_RESIST and State.Fire >= UberCost
+				or Resist == RESIST_TYPES.BULLET_RESIST and Data.Bullet >= UberCost
+				or Resist == RESIST_TYPES.BLAST_RESIST and Data.Blast >= UberCost
+				or Resist == RESIST_TYPES.FIRE_RESIST and Data.Fire >= UberCost
 			then
 				GlobalResistUberState = Resist
 				Ubercharge = true
@@ -2722,7 +2782,7 @@ local Vaccinator = {} do
 			Resist = GlobalResistUberState
 		end
 
-		if State.Flags & AUTO_CHARGE_CANNOT_UBER ~= 0 then
+		if Data.Flags & AUTO_CHARGE_CANNOT_UBER ~= 0 then
 			GlobalResistUberState = -1
 			Ubercharge = false
 		end
@@ -2916,20 +2976,14 @@ local Vaccinator = {} do
 			return
 		end
 
-		local HealingTarget = Weapon:HealingTarget()
+		local HealingTarget = CPlayer.fromCached(Weapon:HealingTarget())
 		if not HealingTarget then
+			-- there's no way to heal a weapon.. should be fine with CPlayer
 			return
 		end
 
-		if config.pop_on_activate_charge.friends_only then
-			if not HealingTarget:IsPlayer() then
-				return
-			end
-			
-			local HealingPlayer = CPlayer.fromCached(HealingTarget)
-			if not HealingPlayer or not HealingPlayer:IsFriend() then
-				return
-			end
+		if config.pop_on_activate_charge.friends_only and not HealingTarget:IsFriend() then
+			return
 		end
 
 		if HealingTarget:GetIndex() == Client then
@@ -2941,6 +2995,16 @@ local Vaccinator = {} do
 				GlobalPreferResist = RESIST_TYPES.BLAST_RESIST
 			elseif WantedResist == "Fire" then
 				GlobalPreferResist = RESIST_TYPES.FIRE_RESIST
+			elseif WantedResist == "Auto" then
+				local UserCmd = DummyUserCmd.new()
+
+				RunAutoVaccinator(UserCmd:Cast())
+				State.Flags = State.Flags | AUTO_CHARGE_FORCE_UBER
+
+				-- State is only reset next times RunAutoVaccinator is called
+				Vaccinator.ProcessData(UserCmd:Cast(), HealingTarget, State)
+			elseif Cooldowns.Get("InvalidActivateChargeResist", 5) then
+				Notify("config.pop_on_activate_charge: resist type '%s' is invalid! Expected 'Bullet', 'Blast', 'Fire' or 'Auto'", tostring(WantedResist))
 			end
 
 			GlobalForceAttack2 = true
@@ -2950,7 +3014,7 @@ end
 
 --- Runs auto vaccinator logic
 ---@param UserCmd UserCmd
-local function RunAutoVaccinator(UserCmd)
+local function _RunAutoVaccinator(UserCmd)
 	if not config.enabled then
 		return
 	end
@@ -3006,16 +3070,18 @@ local function RunAutoVaccinator(UserCmd)
 
 	local Players = entities.FindByClass("CTFPlayer")
 	for _, Player in pairs(Players) do
-		if Player:IsAlive() and not Player:IsDormant() then
-			local CPlayerEnt = CPlayer.from(Player)
-			if not CPlayerEnt then
-				goto continue
-			end
+		if not Player:IsAlive() or Player:IsDormant() then
+			goto continue
+		end
 
-			Vaccinator.HandlePlayer(LocalPlayer, CPlayerEnt, State)
-			if HealingTarget and IsTeammate then
-				Vaccinator.HandlePlayer(HealingTarget, CPlayerEnt, State)
-			end
+		local CPlayerEnt = CPlayer.fromCached(Player)
+		if not CPlayerEnt then
+			goto continue
+		end
+
+		Vaccinator.HandlePlayer(LocalPlayer, CPlayerEnt, State)
+		if HealingTarget and IsTeammate then
+			Vaccinator.HandlePlayer(HealingTarget, CPlayerEnt, State)
 		end
 
 		::continue::
@@ -3054,6 +3120,7 @@ local function RunAutoVaccinator(UserCmd)
 		Vaccinator.ProcessData(UserCmd, HealingTarget, State)
 	end
 end
+RunAutoVaccinator = _RunAutoVaccinator
 
 local function HandleCycle(UserCmd)
 	Vaccinator.HandleAttack2(UserCmd)
@@ -3243,7 +3310,7 @@ local function InLocalServer()
 	return NetChannel:IsLoopback()
 end
 
-if config.debug then --and InLocalServer() then
+if config.debug and InLocalServer() then
 	---@param From Vector3
 	---@param To Vector3
 	local function Line3D(From, To)
@@ -3298,7 +3365,6 @@ if config.debug then --and InLocalServer() then
 				_Y = _Y + Increment
 				return old
 			end
-
 			
 			draw.Text(0, Y(), string.format("Data.Bullet: %d, Overall: %d, Damage: %s", State.Bullet, State.OverallBullet, State.BulletDamage))
 			draw.Text(0, Y(), string.format("Data.Blast: %d, Overall: %d, Damage: %s", State.Blast, State.OverallBlast, State.BlastDamage))
