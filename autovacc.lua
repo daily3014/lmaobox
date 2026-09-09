@@ -65,7 +65,7 @@ local RunAutoVaccinator
 
 local GlobalResistUberState, GlobalWantedResistCycle, GlobalReloadHeld, GlobalCurrentResist = -1, -1, false, -1
 local GlobalResistCheckPredictionTime, GlobalPreferResist, GlobalForceAttack2 = 0, -1, false
-local GlobalTickCount = globals.TickCount()
+local GlobalUserActivateCharge, GlobalTickCount = -1, globals.TickCount()
 
 local CacheEvents = {
 	game_newmap = true,
@@ -119,7 +119,6 @@ local RESIST_TYPES = {
 }
 
 local ManualCharge = RESIST_TYPES.BULLET_RESIST
-
 
 ---@param Message string
 ---@param ... any
@@ -232,6 +231,7 @@ end
 ---@field hasbeenpredicted boolean
 ---@field sendpacket boolean
 local DummyUserCmd = {} do
+	DummyUserCmd.__index = DummyUserCmd
 
 	---@return DummyUserCmd usercmd
 	function DummyUserCmd.new()
@@ -2948,46 +2948,55 @@ local Vaccinator = {} do
 		return true
 	end
 
-	---@param Client number
-	function Vaccinator.PopOnActivateCharge(Client)
-		if Client == client.GetLocalPlayerIndex() then
-			return
+	---@param UserCmd UserCmd
+	---@return boolean handled
+	function Vaccinator.PopOnActivateCharge(UserCmd)
+		if GlobalUserActivateCharge == -1 then
+			return false
+		end
+
+		local UserActiveCharge = GlobalUserActivateCharge
+		GlobalUserActivateCharge = -1
+
+		if UserActiveCharge == client.GetLocalPlayerIndex() then
+			return false
 		end
 
 		local LocalPlayer = CPlayer.fromCached(entities.GetLocalPlayer())
 		if not LocalPlayer then
-			return
+			return false
 		end
 
 		if not LocalPlayer:IsAlive() then
-			return
+			return false
 		end
 
 		if not LocalPlayer:IsClass(TF2_Medic) then
-			return
+			return false
 		end
 
 		local Weapon = LocalPlayer:GetWeapon()
 		if not Weapon or not Weapon:IsVaccinator() then
-			return
+			return false
 		end
 
 		if Weapon:Charges() <= 0 then
-			return
+			return false
 		end
 
 		local HealingTarget = CPlayer.fromCached(Weapon:HealingTarget())
 		if not HealingTarget then
 			-- there's no way to heal a weapon.. should be fine with CPlayer
-			return
+			return false
 		end
 
 		if config.pop_on_activate_charge.friends_only and not HealingTarget:IsFriend() then
-			return
+			return false
 		end
 
-		if HealingTarget:GetIndex() == Client then
+		if HealingTarget:GetIndex() == UserActiveCharge then
 			local WantedResist = config.pop_on_activate_charge.resist
+			GlobalForceAttack2 = true
 
 			if WantedResist == "Bullet" then
 				GlobalPreferResist = RESIST_TYPES.BULLET_RESIST
@@ -2996,19 +3005,24 @@ local Vaccinator = {} do
 			elseif WantedResist == "Fire" then
 				GlobalPreferResist = RESIST_TYPES.FIRE_RESIST
 			elseif WantedResist == "Auto" then
-				local UserCmd = DummyUserCmd.new()
+				RunAutoVaccinator(DummyUserCmd.new():Cast())
 
-				RunAutoVaccinator(UserCmd:Cast())
 				State.Flags = State.Flags | AUTO_CHARGE_FORCE_UBER
+				Vaccinator.ProcessData(UserCmd, HealingTarget, State)
+				--State.Flags = State.Flags & ~AUTO_CHARGE_FORCE_UBER
 
-				-- State is only reset next times RunAutoVaccinator is called
-				Vaccinator.ProcessData(UserCmd:Cast(), HealingTarget, State)
+				--RunAutoVaccinator(UserCmd)
+				GlobalForceAttack2 = false
 			elseif Cooldowns.Get("InvalidActivateChargeResist", 5) then
 				Notify("config.pop_on_activate_charge: resist type '%s' is invalid! Expected 'Bullet', 'Blast', 'Fire' or 'Auto'", tostring(WantedResist))
+				GlobalForceAttack2 = false
 			end
 
-			GlobalForceAttack2 = true
+			return true
 		end
+
+		GlobalUserActivateCharge = -1
+		return false
 	end
 end
 
@@ -3196,8 +3210,15 @@ local function OnDamage(Event)
 	local Crit = Event:GetInt("crit") == 1
 	local MiniCrit = Event:GetInt("minicrit") == 1
 	local WeaponId = Event:GetInt("weaponid")
+	local Damage = Event:GetInt("damageamount")
 
 	if (Crit or MiniCrit) and HitscanWeapons[WeaponId] then
+		if Damage <= 20 and LocalPlayer:HealthPercent() >= 0.5 then
+			-- why bother with some idiot crit bucketing across the map
+			-- just wastes charges
+			return
+		end
+
 		if Cooldowns.Get("Notification0", 1.5) then
 			Notify("Forcing vaccinator charge use because we're hit by a critical shot!")
 		end
@@ -3276,7 +3297,8 @@ local function VoiceListen(UserMessage)
 	local Item = BitBuf:ReadInt(8)
 
 	if Menu == 1 and Item == 6 then
-		Vaccinator.PopOnActivateCharge(Client)
+		--Vaccinator.PopOnActivateCharge(Client)
+		GlobalUserActivateCharge = Client
 	end
 end
 
@@ -3284,7 +3306,12 @@ end
 callbacks.Register("CreateMove", function(UserCmd)
 	GlobalTickCount = globals.TickCount()
 
-	RunAutoVaccinator(UserCmd)
+	local DontRunLogic = Vaccinator.PopOnActivateCharge(UserCmd)
+
+	if not DontRunLogic then
+		RunAutoVaccinator(UserCmd)
+	end
+
 	HandleCycle(UserCmd)
 end)
 
