@@ -1251,7 +1251,7 @@ CWeapon = {} do
 				return math.floor(ChargeMeter * 4)
 			end
 
-			return nil
+			return 0
 		end
 
 		---@return number? charge_level
@@ -1263,7 +1263,7 @@ CWeapon = {} do
 				return ChargeMeter
 			end
 
-			return nil
+			return 0
 		end
 		
 
@@ -2068,9 +2068,9 @@ local function ResistToString(ResistType, Uppercase)
 	local ResistString = "Unknown" do
 		if ResistType == RESIST_TYPES.BULLET_RESIST then
 			ResistString = "Bullet"
-		elseif ResistType == RESIST_TYPES.BULLET_RESIST then
+		elseif ResistType == RESIST_TYPES.BLAST_RESIST then
 			ResistString = "Blast"
-		elseif ResistType == RESIST_TYPES.BULLET_RESIST then
+		elseif ResistType == RESIST_TYPES.FIRE_RESIST then
 			ResistString = "Fire"
 		end
 	end
@@ -3598,21 +3598,23 @@ do -- Vaccinator
 		if not Weapon then
 			return
 		end
-	
-		if not Weapon:IsVaccinator() then
-			return
-		end
-
+		
 		if not self.State.ForceAttack2 then
 			return
 		end
 
+		
 		if self.State.Medigun.PreferredResist < 0 or self.State.Medigun.PreferredResist > 2 then
-			return
+			if Weapon:IsVaccinator() then
+				return
+			end
 		end
 
-		self:SetWantedResist(self.State.Medigun.PreferredResist)
-		if self:IsWantedCycle(self.State.Medigun.PreferredResist) then
+		if Weapon:IsVaccinator() then
+			self:SetWantedResist(self.State.Medigun.PreferredResist)
+		end
+
+		if not Weapon:IsVaccinator() or self:IsWantedCycle(self.State.Medigun.PreferredResist) then
 			UserCmd:SetButtons(UserCmd:GetButtons() | IN_ATTACK2)
 			UserCmd:SetSendPacket(true)
 
@@ -3774,7 +3776,7 @@ do -- Vaccinator
 			return false
 		end
 
-		if Weapon:Charges() <= 0 then
+		if Weapon:IsVaccinator() and Weapon:Charges() <= 0 then
 			return false
 		end
 
@@ -3797,7 +3799,7 @@ do -- Vaccinator
 				self.State.Medigun.PreferredResist = RESIST_TYPES.BLAST_RESIST
 			elseif WantedResist == "Fire" then
 				self.State.Medigun.PreferredResist = RESIST_TYPES.FIRE_RESIST
-			elseif WantedResist and Weapon:IsVaccinator() then
+			elseif WantedResist == "Auto" and Weapon:IsVaccinator() then
 				self:Run(DummyUserCmd.new():Cast(), Data)
 				Data.Flags = Data.Flags | AUTO_CHARGE_FORCE_UBER
 				Vaccinator:ProcessData(UserCmd, HealingTarget, Data)
